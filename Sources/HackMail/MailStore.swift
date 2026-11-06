@@ -8,6 +8,8 @@ final class MailStore: ObservableObject {
     @Published var mailboxes: [MailMailbox] = []
     @Published var selectedMailboxPath = "INBOX"
     @Published var selectedMessageID = -1
+    @Published private(set) var multiSelectedMessageIDs: Set<Int> = []
+    @Published private(set) var isMultiSelectionActive = false
     @Published private(set) var sortColumn: MessageSortColumn = .date
     @Published private(set) var sortDirection: MessageSortDirection = .descending
     @Published var searchText = ""
@@ -39,6 +41,7 @@ final class MailStore: ObservableObject {
     @Published var syncingAccount: String?
     @Published var activeError: String?
     @Published var pendingPermanentDelete: MailMessage?
+    @Published var pendingMultiPermanentDelete: [MailMessage]?
 
     private let accountsKey = "configured-mail-accounts"
     private let contactsContainerKey = "contacts-container-identifier"
@@ -49,6 +52,7 @@ final class MailStore: ObservableObject {
     private var composePreparationID = UUID()
     private var searchRequestID = UUID()
     private var searchNextUIDOffset = 0
+    private var selectionAnchorID: Int?
 
     static let defaultLanguageToolBaseURL = ""
 
@@ -113,6 +117,23 @@ final class MailStore: ObservableObject {
 
     var selectedMessage: MailMessage? {
         filteredMessages.first(where: { $0.id == selectedMessageID }) ?? filteredMessages.first
+    }
+
+    var selectedMessages: [MailMessage] {
+        if isMultiSelectionActive {
+            return filteredMessages.filter { multiSelectedMessageIDs.contains($0.id) }
+        }
+        return selectedMessage.map { [$0] } ?? []
+    }
+
+    func isMessageSelected(_ messageID: Int) -> Bool {
+        isMultiSelectionActive ? multiSelectedMessageIDs.contains(messageID) : selectedMessage?.id == messageID
+    }
+
+    func clearMultiSelection() {
+        multiSelectedMessageIDs = []
+        isMultiSelectionActive = false
+        selectionAnchorID = selectedMessageID >= 0 ? selectedMessageID : nil
     }
 
     var selectedMailbox: MailMailbox? {
@@ -431,6 +452,7 @@ final class MailStore: ObservableObject {
             await performFolderSearch(activeSearchQuery)
             return
         }
+        clearMultiSelection()
         guard let password = try? KeychainStore.loadPassword(for: account.email) else {
             accountStatuses[account.email] = "Needs app password"
             accountErrors[account.email] = "Add a Google app password in Account Settings first."
@@ -548,6 +570,7 @@ final class MailStore: ObservableObject {
     }
 
     private func performFolderSearch(_ query: String) async {
+        clearMultiSelection()
         guard let account = accounts.first(where: { $0.email == selectedAccount }) else {
             searchError = "Select a Gmail account before searching."
             return
@@ -601,6 +624,7 @@ final class MailStore: ObservableObject {
         searchNextUIDOffset = 0
         searchError = nil
         isLoadingMoreSearchResults = false
+        clearMultiSelection()
     }
 
     func loadBody(for message: MailMessage, accountEmail: String?) async {
@@ -698,6 +722,49 @@ final class MailStore: ObservableObject {
     }
 
     func select(_ message: MailMessage) {
+        clearMultiSelection()
+        selectionAnchorID = message.id
+        focusMessage(message)
+    }
+
+    func select(
+        _ message: MailMessage,
+        command: Bool,
+        shift: Bool,
+        visibleMessages: [MailMessage]
+    ) {
+        if shift {
+            isMultiSelectionActive = true
+            let anchorID = selectionAnchorID ?? selectedMessageID
+            if let anchorIndex = visibleMessages.firstIndex(where: { $0.id == anchorID }),
+               let clickedIndex = visibleMessages.firstIndex(where: { $0.id == message.id }) {
+                let lower = min(anchorIndex, clickedIndex)
+                let upper = max(anchorIndex, clickedIndex)
+                multiSelectedMessageIDs = Set(visibleMessages[lower...upper].map(\.id))
+            } else {
+                multiSelectedMessageIDs = [message.id]
+                selectionAnchorID = message.id
+            }
+        } else if command {
+            if !isMultiSelectionActive {
+                isMultiSelectionActive = true
+                multiSelectedMessageIDs = selectedMessageID >= 0 ? [selectedMessageID] : []
+            }
+            if multiSelectedMessageIDs.contains(message.id) {
+                multiSelectedMessageIDs.remove(message.id)
+            } else {
+                multiSelectedMessageIDs.insert(message.id)
+            }
+            if selectionAnchorID == nil { selectionAnchorID = selectedMessageID >= 0 ? selectedMessageID : message.id }
+        } else {
+            multiSelectedMessageIDs = []
+            isMultiSelectionActive = false
+            selectionAnchorID = message.id
+        }
+        focusMessage(message)
+    }
+
+    private func focusMessage(_ message: MailMessage) {
         selectedMessageID = message.id
         if !message.isRemote {
             messages = messages.map { item in
@@ -761,6 +828,28 @@ final class MailStore: ObservableObject {
         Task { await performRemoteAction(.delete(isTrash: false, trashPath: trashPath), message: message, accountEmail: accountEmail) }
     }
 
+    func archiveSelectedMessages() {
+        guard isMultiSelectionActive else { return }
+        Task { await performBulkRemoteAction(.archive, messages: selectedMessages) }
+    }
+
+    func moveSelectedMessages(to mailbox: MailMailbox) {
+        guard isMultiSelectionActive else { return }
+        Task { await performBulkRemoteAction(.move(mailbox.path), messages: selectedMessages) }
+    }
+
+    func deleteSelectedMessages() {
+        guard isMultiSelectionActive else { return }
+        let messagesToDelete = selectedMessages
+        guard !messagesToDelete.isEmpty else { return }
+        if selectedMailbox?.isTrash == true {
+            pendingMultiPermanentDelete = messagesToDelete
+            return
+        }
+        let trashPath = mailboxes.first(where: { $0.isTrash })?.path
+        Task { await performBulkRemoteAction(.delete(isTrash: false, trashPath: trashPath), messages: messagesToDelete) }
+    }
+
     func confirmPermanentDelete() {
         guard let message = pendingPermanentDelete else { return }
         let accountEmail = selectedAccount
@@ -768,8 +857,15 @@ final class MailStore: ObservableObject {
         Task { await performRemoteAction(.delete(isTrash: true, trashPath: nil), message: message, accountEmail: accountEmail) }
     }
 
+    func confirmMultiPermanentDelete() {
+        guard let messagesToDelete = pendingMultiPermanentDelete, !messagesToDelete.isEmpty else { return }
+        pendingMultiPermanentDelete = nil
+        Task { await performBulkRemoteAction(.delete(isTrash: true, trashPath: nil), messages: messagesToDelete) }
+    }
+
     func cancelPermanentDelete() {
         pendingPermanentDelete = nil
+        pendingMultiPermanentDelete = nil
     }
 
     private enum RemoteAction {
@@ -777,6 +873,64 @@ final class MailStore: ObservableObject {
         case star(Bool)
         case move(String)
         case delete(isTrash: Bool, trashPath: String?)
+    }
+
+    private enum BulkRemoteAction {
+        case archive
+        case move(String)
+        case delete(isTrash: Bool, trashPath: String?)
+    }
+
+    private func performBulkRemoteAction(_ action: BulkRemoteAction, messages messagesToActOn: [MailMessage]) async {
+        guard !messagesToActOn.isEmpty,
+              messagesToActOn.allSatisfy({ $0.isRemote && $0.mailboxPath == selectedMailboxPath }),
+              let account = accounts.first(where: { $0.email == selectedAccount }),
+              let password = try? KeychainStore.loadPassword(for: account.email) else { return }
+
+        let sourceMailbox = selectedMailboxPath
+        let messageIDs = Set(messagesToActOn.map(\.id))
+        let uids = Array(messageIDs)
+        syncingAccount = account.email
+        accountErrors[account.email] = nil
+        activeError = nil
+        defer { syncingAccount = nil }
+
+        do {
+            let client = GmailIMAPClient()
+            switch action {
+            case .archive:
+                try await client.archive(uids: uids, mailboxPath: sourceMailbox, email: account.email, password: password)
+            case .move(let destination):
+                try await client.move(uids: uids, from: sourceMailbox, to: destination, email: account.email, password: password)
+            case .delete(let isTrash, let trashPath):
+                try await client.delete(uids: uids, mailboxPath: sourceMailbox, isTrash: isTrash, trashPath: trashPath, email: account.email, password: password)
+            }
+
+            guard selectedAccount == account.email, selectedMailboxPath == sourceMailbox else { return }
+            let shouldRemoveFromCurrentMailbox: Bool
+            let status: String
+            switch action {
+            case .archive:
+                shouldRemoveFromCurrentMailbox = selectedMailbox?.isInbox == true
+                status = "Connected · \(messagesToActOn.count) messages archived"
+            case .move:
+                shouldRemoveFromCurrentMailbox = true
+                status = "Connected · \(messagesToActOn.count) messages moved"
+            case .delete(let isTrash, _):
+                shouldRemoveFromCurrentMailbox = true
+                status = isTrash
+                    ? "Connected · \(messagesToActOn.count) messages permanently deleted"
+                    : "Connected · \(messagesToActOn.count) messages moved to Trash"
+            }
+            if shouldRemoveFromCurrentMailbox {
+                removeFromCurrentMailbox(messageIDs, account: account)
+            }
+            clearMultiSelection()
+            accountStatuses[account.email] = status
+        } catch {
+            accountErrors[account.email] = error.localizedDescription
+            activeError = error.localizedDescription
+        }
     }
 
     private func performRemoteAction(_ action: RemoteAction, message: MailMessage, accountEmail: String?) async {
@@ -826,10 +980,22 @@ final class MailStore: ObservableObject {
     }
 
     private func removeFromCurrentMailbox(_ messageID: Int, account: MailAccount) {
-        messages.removeAll { $0.id == messageID }
-        guard selectedMessageID == messageID else { return }
-        selectedMessageID = messages.first?.id ?? -1
-        if let nextMessage = messages.first, nextMessage.body.isEmpty {
+        removeFromCurrentMailbox([messageID], account: account)
+    }
+
+    private func removeFromCurrentMailbox(_ messageIDs: Set<Int>, account: MailAccount) {
+        let selectedMessageWasRemoved = messageIDs.contains(selectedMessageID)
+        messages.removeAll { messageIDs.contains($0.id) }
+        if activeSearchQuery != nil {
+            let loadedRemovedCount = searchResultUIDs.prefix(searchNextUIDOffset).filter { messageIDs.contains($0) }.count
+            searchResultUIDs.removeAll { messageIDs.contains($0) }
+            searchNextUIDOffset = max(0, searchNextUIDOffset - loadedRemovedCount)
+        }
+        multiSelectedMessageIDs.subtract(messageIDs)
+        if multiSelectedMessageIDs.isEmpty { isMultiSelectionActive = false }
+        guard selectedMessageWasRemoved else { return }
+        selectedMessageID = filteredMessages.first?.id ?? -1
+        if let nextMessage = selectedMessage, nextMessage.body.isEmpty {
             Task { await loadBody(for: nextMessage, accountEmail: account.email) }
         }
     }

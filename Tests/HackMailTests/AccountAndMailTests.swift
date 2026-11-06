@@ -359,6 +359,29 @@ final class MailStoreNavigationTests: XCTestCase {
     }
 
     @MainActor
+    func testCommandAndShiftClickSelectMessageGroups() throws {
+        let suiteName = "HackMailTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = MailStore(defaults: defaults)
+        store.messages = (1...4).map { id in
+            MailMessage(id: id, sender: "Sender \(id)", senderEmail: "sender\(id)@example.com", time: "", subject: "Message \(id)", preview: "", body: "")
+        }
+        let visibleMessages = store.filteredMessages
+        store.selectedMessageID = 1
+
+        store.select(visibleMessages[2], command: true, shift: false, visibleMessages: visibleMessages)
+        XCTAssertEqual(store.multiSelectedMessageIDs, [1, 3])
+        store.select(visibleMessages[1], command: true, shift: false, visibleMessages: visibleMessages)
+        XCTAssertEqual(store.multiSelectedMessageIDs, [1, 2, 3])
+
+        store.select(visibleMessages[1])
+        store.select(visibleMessages[3], command: false, shift: true, visibleMessages: visibleMessages)
+        XCTAssertEqual(store.multiSelectedMessageIDs, [2, 3, 4])
+        XCTAssertEqual(store.selectedMessages.map(\.id), [2, 3, 4])
+    }
+
+    @MainActor
     func testMessageListCanSortAndResortAppendedSearchResults() throws {
         let suiteName = "HackMailTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

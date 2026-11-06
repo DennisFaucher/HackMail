@@ -13,7 +13,8 @@ swift run
 Run the automated checks with `swift test`.
 
 In the message list, click a row or mailbox to focus the list, then use **↑ / ↓** to move through
-messages and update the reader.
+messages and update the reader. **Command-click** adds or removes messages from a selection;
+**Shift-click** selects a range. Bulk toolbar actions move, archive, or delete selected messages.
 
 Build and launch a local app bundle:
 

@@ -55,14 +55,27 @@ struct MailWindow: View {
         } message: {
             Text(store.activeError ?? "An unexpected Gmail error occurred.")
         }
-        .confirmationDialog("Permanently delete this message?", isPresented: Binding(
-            get: { store.pendingPermanentDelete != nil },
+        .confirmationDialog(
+            store.pendingMultiPermanentDelete == nil ? "Permanently delete this message?" : "Permanently delete these messages?",
+            isPresented: Binding(
+            get: { store.pendingPermanentDelete != nil || store.pendingMultiPermanentDelete != nil },
             set: { if !$0 { store.cancelPermanentDelete() } }
         )) {
-            Button("Delete Permanently", role: .destructive) { store.confirmPermanentDelete() }
+            Button(
+                store.pendingMultiPermanentDelete.map { "Delete \($0.count) Permanently" } ?? "Delete Permanently",
+                role: .destructive
+            ) {
+                if store.pendingMultiPermanentDelete != nil {
+                    store.confirmMultiPermanentDelete()
+                } else {
+                    store.confirmPermanentDelete()
+                }
+            }
             Button("Cancel", role: .cancel) { store.cancelPermanentDelete() }
         } message: {
-            Text("This message will be permanently removed from Gmail and cannot be recovered.")
+            Text(store.pendingMultiPermanentDelete == nil
+                ? "This message will be permanently removed from Gmail and cannot be recovered."
+                : "These messages will be permanently removed from Gmail and cannot be recovered.")
         }
         .task {
             if store.accounts.isEmpty {
@@ -76,7 +89,6 @@ struct MailWindow: View {
 
     private var messageList: some View {
         let visibleMessages = store.filteredMessages
-        let selectedMessageID = store.selectedMessage?.id
         return ScrollView {
             if visibleMessages.isEmpty {
                 if store.syncingAccount != nil {
@@ -117,13 +129,18 @@ struct MailWindow: View {
                         ForEach(visibleMessages) { message in
                             MessageRow(
                                 message: message,
-                                selected: message.id == selectedMessageID,
+                                selected: store.isMessageSelected(message.id),
                                 onToggleStar: {
                                     store.toggleFlag(message)
                                     messageListFocused = true
                                 },
-                                onSelect: {
-                                    store.select(message)
+                                onSelect: { modifiers in
+                                    store.select(
+                                        message,
+                                        command: modifiers.contains(.command),
+                                        shift: modifiers.contains(.shift),
+                                        visibleMessages: visibleMessages
+                                    )
                                     messageListFocused = true
                                 }
                             )
@@ -165,7 +182,7 @@ struct MailWindow: View {
             default: break
             }
         }
-        .accessibilityHint("Use the Up and Down arrow keys to move between messages")
+        .accessibilityHint("Click to select a message, Command-click to add or remove it, and Shift-click to select a range. Use the Up and Down arrow keys to move between messages.")
     }
 
     private func tableHeading(_ column: MessageSortColumn, alignment: Alignment) -> some View {
@@ -371,31 +388,57 @@ private struct MailToolbar: View {
             }.disabled(store.syncingAccount != nil)
             toolbarButton("square.and.pencil", help: "New Message") { store.beginNewMessage() }
                 .disabled(store.isSendingMessage || store.isPreparingCompose)
-            toolbarButton("archivebox", help: "Archive") { store.archiveSelected() }
-                .disabled(store.selectedMessage?.isRemote != true || store.syncingAccount != nil)
-            Menu {
-                ForEach(store.mailboxes.filter { $0.path != store.selectedMailboxPath }) { mailbox in
-                    Button(mailbox.name, systemImage: mailbox.symbol) { store.moveSelected(to: mailbox) }
+            if store.isMultiSelectionActive {
+                HStack(spacing: 5) {
+                    Text("\(store.selectedMessages.count) selected")
+                        .font(.system(size: 11, weight: .medium)).foregroundStyle(Paper.secondary)
+                        .lineLimit(1).fixedSize()
+                    Menu {
+                        ForEach(store.mailboxes.filter { $0.path != store.selectedMailboxPath }) { mailbox in
+                            Button(mailbox.name, systemImage: mailbox.symbol) { store.moveSelectedMessages(to: mailbox) }
+                        }
+                    } label: {
+                        Image(systemName: "folder").font(.system(size: 14)).foregroundStyle(Paper.ink).frame(width: 32, height: 30)
+                    }
+                    .menuStyle(.borderlessButton).fixedSize(horizontal: true, vertical: false).frame(width: 36, height: 30)
+                    .accessibilityLabel("Move selected messages to mailbox")
+                    .help("Move selected messages to mailbox")
+                    .disabled(!canApplyBulkAction || store.mailboxes.count < 2)
+                    toolbarButton("archivebox", help: "Archive Selected Messages") { store.archiveSelectedMessages() }
+                        .disabled(!canApplyBulkAction)
+                    toolbarButton("trash", help: store.selectedMailbox?.isTrash == true ? "Permanently Delete Selected" : "Move Selected to Trash") {
+                        store.deleteSelectedMessages()
+                    }
+                    .disabled(!canApplyBulkAction)
+                    toolbarButton("xmark", help: "Clear Multi-Selection") { store.clearMultiSelection() }
                 }
-            } label: {
-                Image(systemName: "folder").font(.system(size: 14)).foregroundStyle(Paper.ink).frame(width: 32, height: 30)
+            } else {
+                toolbarButton("archivebox", help: "Archive") { store.archiveSelected() }
+                    .disabled(store.selectedMessage?.isRemote != true || store.syncingAccount != nil)
+                Menu {
+                    ForEach(store.mailboxes.filter { $0.path != store.selectedMailboxPath }) { mailbox in
+                        Button(mailbox.name, systemImage: mailbox.symbol) { store.moveSelected(to: mailbox) }
+                    }
+                } label: {
+                    Image(systemName: "folder").font(.system(size: 14)).foregroundStyle(Paper.ink).frame(width: 32, height: 30)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize(horizontal: true, vertical: false)
+                .frame(width: 40, height: 30)
+                .accessibilityLabel("Move to mailbox")
+                .help("Move to mailbox")
+                .disabled(store.selectedMessage?.isRemote != true || store.syncingAccount != nil || store.mailboxes.count < 2)
+                toolbarButton("trash", help: store.selectedMailbox?.isTrash == true ? "Delete Permanently" : "Move to Trash") { store.deleteSelected() }
+                    .disabled(store.selectedMessage?.isRemote != true || store.syncingAccount != nil)
+                Rectangle().fill(Paper.border).frame(width: 1, height: 18).padding(.horizontal, 5)
+                toolbarButton("arrowshape.turn.up.left", help: "Reply") { store.beginReply() }
+                    .disabled(store.selectedMessage == nil || store.selectedMessage?.senderEmail.isEmpty != false || store.selectedMessage?.bodyIsLoading == true || store.syncingAccount != nil || store.isSendingMessage || store.isPreparingCompose)
+                toolbarButton("arrowshape.turn.up.right", help: "Forward") { store.beginForward() }
+                    .disabled(store.selectedMessage == nil || store.selectedMessage?.bodyIsLoading == true || store.syncingAccount != nil || store.isSendingMessage || store.isPreparingCompose)
+                toolbarButton("flag", help: "Flag") {
+                    if let message = store.selectedMessage { store.toggleFlag(message) }
+                }.disabled(store.syncingAccount != nil)
             }
-            .menuStyle(.borderlessButton)
-            .fixedSize(horizontal: true, vertical: false)
-            .frame(width: 40, height: 30)
-            .accessibilityLabel("Move to mailbox")
-            .help("Move to mailbox")
-            .disabled(store.selectedMessage?.isRemote != true || store.syncingAccount != nil || store.mailboxes.count < 2)
-            toolbarButton("trash", help: store.selectedMailbox?.isTrash == true ? "Delete Permanently" : "Move to Trash") { store.deleteSelected() }
-                .disabled(store.selectedMessage?.isRemote != true || store.syncingAccount != nil)
-            Rectangle().fill(Paper.border).frame(width: 1, height: 18).padding(.horizontal, 5)
-            toolbarButton("arrowshape.turn.up.left", help: "Reply") { store.beginReply() }
-                .disabled(store.selectedMessage == nil || store.selectedMessage?.senderEmail.isEmpty != false || store.selectedMessage?.bodyIsLoading == true || store.syncingAccount != nil || store.isSendingMessage || store.isPreparingCompose)
-            toolbarButton("arrowshape.turn.up.right", help: "Forward") { store.beginForward() }
-                .disabled(store.selectedMessage == nil || store.selectedMessage?.bodyIsLoading == true || store.syncingAccount != nil || store.isSendingMessage || store.isPreparingCompose)
-            toolbarButton("flag", help: "Flag") {
-                if let message = store.selectedMessage { store.toggleFlag(message) }
-            }.disabled(store.syncingAccount != nil)
             toolbarButton("gearshape", help: "Account Settings") { store.showSettings = true }
         }
         .padding(.horizontal, 16).frame(height: 62)
@@ -407,13 +450,17 @@ private struct MailToolbar: View {
             .accessibilityLabel(help)
             .help(help)
     }
+
+    private var canApplyBulkAction: Bool {
+        !store.selectedMessages.isEmpty && store.selectedMessages.allSatisfy(\.isRemote) && store.syncingAccount == nil
+    }
 }
 
 private struct MessageRow: View {
     let message: MailMessage
     let selected: Bool
     let onToggleStar: () -> Void
-    let onSelect: () -> Void
+    let onSelect: (NSEvent.ModifierFlags) -> Void
 
     var body: some View {
         LazyVGrid(columns: mailTableColumns, alignment: .leading, spacing: 0) {
@@ -427,7 +474,7 @@ private struct MessageRow: View {
             .accessibilityLabel(message.flagged ? "Remove star from \(message.subject)" : "Star \(message.subject)")
             .help(message.flagged ? "Remove star" : "Star message")
 
-            Button(action: onSelect) {
+            Button { onSelect(NSEvent.modifierFlags) } label: {
                 HStack(spacing: 6) {
                     if message.unread { Circle().fill(Paper.accent).frame(width: 5, height: 5) }
                     Text(message.subject).font(.custom(Paper.mailFont, size: 13.5)).fontWeight(message.unread ? .semibold : .regular).lineLimit(1)
@@ -435,12 +482,12 @@ private struct MessageRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .buttonStyle(.plain)
-            Button(action: onSelect) {
+            Button { onSelect(NSEvent.modifierFlags) } label: {
                 Text(message.sender).font(.custom(Paper.mailFont, size: 13)).lineLimit(1)
                     .foregroundStyle(message.unread ? Paper.ink : Paper.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }.buttonStyle(.plain)
-            Button(action: onSelect) {
+            Button { onSelect(NSEvent.modifierFlags) } label: {
                 Text(message.time).font(.custom(Paper.mailFont, size: 12)).foregroundStyle(Paper.secondary)
                     .lineLimit(1).frame(maxWidth: .infinity, alignment: .trailing)
             }.buttonStyle(.plain)

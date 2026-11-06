@@ -58,6 +58,14 @@ struct GmailIMAPClient {
         }
     }
 
+    func move(uids: [Int], from mailboxPath: String, to destination: String, email: String, password: String) async throws {
+        guard !uids.isEmpty else { return }
+        try await withSession(email: email, password: password) { session in
+            try await session.selectMailbox(path: mailboxPath)
+            try await session.move(uids: uids, to: destination)
+        }
+    }
+
     func delete(uid: Int, mailboxPath: String, isTrash: Bool, trashPath: String?, email: String, password: String) async throws {
         try await withSession(email: email, password: password) { session in
             try await session.selectMailbox(path: mailboxPath)
@@ -68,6 +76,28 @@ struct GmailIMAPClient {
             } else {
                 throw IMAPError.protocolError("Gmail did not provide a Trash mailbox.")
             }
+        }
+    }
+
+    func delete(uids: [Int], mailboxPath: String, isTrash: Bool, trashPath: String?, email: String, password: String) async throws {
+        guard !uids.isEmpty else { return }
+        try await withSession(email: email, password: password) { session in
+            try await session.selectMailbox(path: mailboxPath)
+            if isTrash {
+                try await session.permanentlyDelete(uids: uids)
+            } else if let trashPath {
+                try await session.move(uids: uids, to: trashPath)
+            } else {
+                throw IMAPError.protocolError("Gmail did not provide a Trash mailbox.")
+            }
+        }
+    }
+
+    func archive(uids: [Int], mailboxPath: String, email: String, password: String) async throws {
+        guard !uids.isEmpty else { return }
+        try await withSession(email: email, password: password) { session in
+            try await session.selectMailbox(path: mailboxPath)
+            try await session.archive(uids: uids)
         }
     }
 
@@ -315,11 +345,16 @@ private actor IMAPSession {
     }
 
     func archive(uid: Int) async throws {
+        try await archive(uids: [uid])
+    }
+
+    func archive(uids: [Int]) async throws {
+        guard let uidSet = makeUIDSet(uids) else { return }
         try await loadCapabilities()
         guard capabilities.contains("X-GM-EXT-1") else {
             throw IMAPError.protocolError("Gmail's label extension is unavailable; archive was not performed.")
         }
-        _ = try await command("UID STORE \(uid) -X-GM-LABELS.SILENT (\\Inbox)")
+        _ = try await command("UID STORE \(uidSet) -X-GM-LABELS.SILENT (\\Inbox)")
     }
 
     func setStarred(uid: Int, starred: Bool) async throws {
@@ -328,9 +363,14 @@ private actor IMAPSession {
     }
 
     func move(uid: Int, to destination: String) async throws {
+        try await move(uids: [uid], to: destination)
+    }
+
+    func move(uids: [Int], to destination: String) async throws {
+        guard let uidSet = makeUIDSet(uids) else { return }
         try await loadCapabilities()
         if capabilities.contains("MOVE") {
-            let moveCommand = "UID MOVE \(uid) \(quote(destination))"
+            let moveCommand = "UID MOVE \(uidSet) \(quote(destination))"
             do {
                 _ = try await command(moveCommand)
             } catch IMAPError.protocolError(let detail) where detail.localizedCaseInsensitiveContains("SYSTEM ERROR") {
@@ -340,21 +380,32 @@ private actor IMAPSession {
                 _ = try await command(moveCommand)
             }
         } else if capabilities.contains("UIDPLUS") {
-            _ = try await command("UID COPY \(uid) \(quote(destination))")
-            _ = try await command("UID STORE \(uid) +FLAGS.SILENT (\\Deleted)")
-            _ = try await command("UID EXPUNGE \(uid)")
+            _ = try await command("UID COPY \(uidSet) \(quote(destination))")
+            _ = try await command("UID STORE \(uidSet) +FLAGS.SILENT (\\Deleted)")
+            _ = try await command("UID EXPUNGE \(uidSet)")
         } else {
             throw IMAPError.protocolError("This Gmail server does not support a safe move operation.")
         }
     }
 
     func permanentlyDelete(uid: Int) async throws {
+        try await permanentlyDelete(uids: [uid])
+    }
+
+    func permanentlyDelete(uids: [Int]) async throws {
+        guard let uidSet = makeUIDSet(uids) else { return }
         try await loadCapabilities()
         guard capabilities.contains("UIDPLUS") else {
             throw IMAPError.protocolError("This Gmail server does not support safe permanent deletion.")
         }
-        _ = try await command("UID STORE \(uid) +FLAGS.SILENT (\\Deleted)")
-        _ = try await command("UID EXPUNGE \(uid)")
+        _ = try await command("UID STORE \(uidSet) +FLAGS.SILENT (\\Deleted)")
+        _ = try await command("UID EXPUNGE \(uidSet)")
+    }
+
+    private func makeUIDSet(_ uids: [Int]) -> String? {
+        let uniqueUIDs = Array(Set(uids.filter { $0 > 0 })).sorted()
+        guard !uniqueUIDs.isEmpty else { return nil }
+        return uniqueUIDs.map(String.init).joined(separator: ",")
     }
 
     private func loadCapabilities() async throws {
