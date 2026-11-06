@@ -1,6 +1,8 @@
 # HackMail
 
-A native SwiftUI macOS Gmail client.
+A native SwiftUI macOS Gmail client that works completely online with low RAM footprint.
+
+<img width="1256" height="1049" alt="image" src="https://github.com/user-attachments/assets/beca47db-2348-41b7-beef-71b14e93430a" />
 
 ## Run
 
