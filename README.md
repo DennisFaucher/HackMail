@@ -34,16 +34,13 @@ Google app passwords are 16 characters (often displayed in four groups), not nec
 
 ## Current scope
 
-The app connects to Gmail over TLS and fetches recent mailbox headers. When you open a message, it
-fetches a bounded HTML MIME body part when available, falling back to plain text. Press **Esc** or
-click **Cancel** to interrupt a stalled message-body load. The reader renders HTML in a
-JavaScript-disabled, non-persistent WebKit view that blocks remote resources; clicked HTTP(S)
-links require confirmation and open in the system browser. In plain-text mail, parenthesized long
-URLs display as links on their neighboring labels; standalone URLs remain visible. A separate
-full-message opt-in fetches the complete text body and permits remote images only after a privacy warning; scripts, remote
-stylesheets, and attachments remain blocked.
-CID-referenced inline images bundled inside a message are resolved in memory; this does not contact
-the image host.
+* The app connects to Gmail over TLS and fetches recent mailbox headers. When you open a message, it
+fetches a bounded HTML MIME body part when available, falling back to plain text.
+* Press **Esc** or click **Cancel** to interrupt a stalled message-body load.
+* The reader renders HTML in a JavaScript-disabled, non-persistent WebKit view that blocks remote resources; clicked HTTP(S) links require confirmation and open in the system browser.
+* In plain-text mail, parenthesized long URLs display as links on their neighboring labels; standalone URLs remain visible.
+* A separate full-message opt-in fetches the complete text body and permits remote images only after a privacy warning; scripts, remote stylesheets, and attachments remain blocked. CID-referenced inline images bundled inside a message are resolved in memory; this does not contact the image host.
+
 While HackMail is running, Gmail IMAP IDLE watches each configured Inbox and refreshes the selected
 Inbox when new mail arrives. Generic macOS notifications are enabled by default; notification
 permission can be changed in **Mail → Mail Accounts…**.
