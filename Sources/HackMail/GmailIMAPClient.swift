@@ -51,6 +51,14 @@ struct GmailIMAPClient {
         }
     }
 
+    func setStarred(uids: [Int], mailboxPath: String, starred: Bool, email: String, password: String) async throws {
+        guard !uids.isEmpty else { return }
+        try await withSession(email: email, password: password, shouldLogout: false) { session in
+            try await session.selectMailbox(path: mailboxPath)
+            try await session.setStarred(uids: uids, starred: starred)
+        }
+    }
+
     func move(uid: Int, from mailboxPath: String, to destination: String, email: String, password: String) async throws {
         try await withSession(email: email, password: password) { session in
             try await session.selectMailbox(path: mailboxPath)
@@ -108,15 +116,21 @@ struct GmailIMAPClient {
         operation: @Sendable (IMAPSession) async throws -> T
     ) async throws -> T {
         let session = IMAPSession()
-        do {
-            try await session.open(email: email, password: password)
-            let result = try await operation(session)
-            if shouldLogout { try await session.logout() }
-            await session.close()
-            return result
-        } catch {
-            await session.close()
-            throw error
+        return try await withTaskCancellationHandler {
+            do {
+                try Task.checkCancellation()
+                try await session.open(email: email, password: password)
+                let result = try await operation(session)
+                try Task.checkCancellation()
+                if shouldLogout { try await session.logout() }
+                await session.close()
+                return result
+            } catch {
+                await session.close()
+                throw error
+            }
+        } onCancel: {
+            Task { await session.close() }
         }
     }
 }
@@ -358,8 +372,13 @@ private actor IMAPSession {
     }
 
     func setStarred(uid: Int, starred: Bool) async throws {
+        try await setStarred(uids: [uid], starred: starred)
+    }
+
+    func setStarred(uids: [Int], starred: Bool) async throws {
+        guard let uidSet = makeUIDSet(uids) else { return }
         let operation = starred ? "+FLAGS.SILENT" : "-FLAGS.SILENT"
-        _ = try await command("UID STORE \(uid) \(operation) (\\Flagged)")
+        _ = try await command("UID STORE \(uidSet) \(operation) (\\Flagged)")
     }
 
     func move(uid: Int, to destination: String) async throws {

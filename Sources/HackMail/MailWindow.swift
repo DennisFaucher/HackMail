@@ -404,6 +404,11 @@ private struct MailToolbar: View {
                     .popover(isPresented: $isShowingMoveMenu, arrowEdge: .bottom) { moveMailboxPopover }
                     toolbarButton("archivebox", help: "Archive Selected Messages") { store.archiveSelectedMessages() }
                         .disabled(!canApplyBulkAction)
+                    toolbarButton(
+                        store.selectedMessagesAreAllFlagged ? "flag.fill" : "flag",
+                        help: store.selectedMessagesAreAllFlagged ? "Unflag Selected Messages" : "Flag Selected Messages"
+                    ) { store.toggleFlagSelectedMessages() }
+                        .disabled(!canApplyBulkAction)
                     toolbarButton("trash", help: store.selectedMailbox?.isTrash == true ? "Permanently Delete Selected" : "Move Selected to Trash") {
                         store.deleteSelectedMessages()
                     }
@@ -559,7 +564,20 @@ private struct MessageReader: View {
                         Text(message.time).font(.system(size: 11.5)).foregroundStyle(Paper.secondary)
                     }.padding(.vertical, 8)
                     Rectangle().fill(Paper.border).frame(height: 1).padding(.vertical, 13)
-                    if message.isRemote && !message.bodyIsLoading && (message.bodyIsPartial || (message.bodyIsHTML && !message.allowsRemoteImages)) {
+                    if store.loadingMessageID == message.id {
+                        HStack(spacing: 10) {
+                            ProgressView().controlSize(.small)
+                            Text("Loading message from Gmail…").font(.system(size: 12)).foregroundStyle(Paper.secondary)
+                            Spacer()
+                            Button("Cancel (Esc)") { store.cancelCurrentMessageLoad() }
+                                .buttonStyle(.bordered).controlSize(.small)
+                                .keyboardShortcut(.cancelAction)
+                        }
+                        .padding(12)
+                        .background(Color(hex: 0xF4EFE6), in: RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Paper.border, lineWidth: 1))
+                        .padding(.bottom, 14)
+                    } else if message.isRemote && !message.bodyIsLoading && (message.bodyIsPartial || (message.bodyIsHTML && !message.allowsRemoteImages)) {
                         HStack(alignment: .center, spacing: 12) {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(message.bodyIsPartial ? "Message preview is limited" : "Remote images are blocked")
@@ -592,7 +610,9 @@ private struct MessageReader: View {
                         }
                         .padding(.bottom, 12)
                     }
-                    if message.bodyIsHTML {
+                    if store.loadingMessageID == message.id {
+                        EmptyView()
+                    } else if message.bodyIsHTML {
                         HTMLMessageView(html: message.body, allowRemoteImages: message.allowsRemoteImages, onOpenLink: requestLinkConfirmation)
                             .frame(maxWidth: .infinity).frame(height: 480)
                             .padding(.top, 4)

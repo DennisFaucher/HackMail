@@ -42,6 +42,7 @@ final class MailStore: ObservableObject {
     @Published var activeError: String?
     @Published var pendingPermanentDelete: MailMessage?
     @Published var pendingMultiPermanentDelete: [MailMessage]?
+    @Published private(set) var loadingMessageID: Int?
 
     private let accountsKey = "configured-mail-accounts"
     private let contactsContainerKey = "contacts-container-identifier"
@@ -53,6 +54,9 @@ final class MailStore: ObservableObject {
     private var searchRequestID = UUID()
     private var searchNextUIDOffset = 0
     private var selectionAnchorID: Int?
+    private var messageBodyLoadID = UUID()
+    private var messageBodyLoadTask: Task<FetchedMessageBody, Error>?
+    private var messageBodyBeforeLoad: String?
 
     static let defaultLanguageToolBaseURL = ""
 
@@ -124,6 +128,10 @@ final class MailStore: ObservableObject {
             return filteredMessages.filter { multiSelectedMessageIDs.contains($0.id) }
         }
         return selectedMessage.map { [$0] } ?? []
+    }
+
+    var selectedMessagesAreAllFlagged: Bool {
+        !selectedMessages.isEmpty && selectedMessages.allSatisfy(\.flagged)
     }
 
     func isMessageSelected(_ messageID: Int) -> Bool {
@@ -630,11 +638,34 @@ final class MailStore: ObservableObject {
     func loadBody(for message: MailMessage, accountEmail: String?) async {
         guard message.isRemote, let account = accounts.first(where: { $0.email == accountEmail }),
               let password = try? KeychainStore.loadPassword(for: account.email) else { return }
+        guard loadingMessageID != message.id else { return }
+        messageBodyLoadTask?.cancel()
+        let requestID = UUID()
+        messageBodyLoadID = requestID
+        loadingMessageID = message.id
+        messageBodyBeforeLoad = message.body
         markBodyLoading(message.id, loading: true, replaceWithPlaceholder: true)
         syncingAccount = account.email
-        defer { syncingAccount = nil }
+        defer {
+            if messageBodyLoadID == requestID {
+                messageBodyLoadTask = nil
+                loadingMessageID = nil
+                messageBodyBeforeLoad = nil
+                if syncingAccount == account.email { syncingAccount = nil }
+            }
+        }
         do {
-            let fetchedBody = try await GmailIMAPClient().fetchBody(uid: message.id, mailboxPath: message.mailboxPath, email: account.email, password: password)
+            let loadTask = Task {
+                try await GmailIMAPClient().fetchBody(
+                    uid: message.id,
+                    mailboxPath: message.mailboxPath,
+                    email: account.email,
+                    password: password
+                )
+            }
+            messageBodyLoadTask = loadTask
+            let fetchedBody = try await loadTask.value
+            guard messageBodyLoadID == requestID else { return }
             guard selectedAccount == account.email, selectedMailboxPath == message.mailboxPath else { return }
             messages = messages.map { item in
                 guard item.id == message.id else { return item }
@@ -647,6 +678,7 @@ final class MailStore: ObservableObject {
                 return updated
             }
         } catch {
+            guard messageBodyLoadID == requestID else { return }
             guard selectedAccount == account.email, selectedMailboxPath == message.mailboxPath else { return }
             accountErrors[account.email] = "Could not load message body: \(error.localizedDescription)"
             activeError = accountErrors[account.email]
@@ -660,6 +692,25 @@ final class MailStore: ObservableObject {
         }
     }
 
+    func cancelCurrentMessageLoad() {
+        guard let messageID = loadingMessageID else { return }
+        let accountEmail = selectedAccount
+        let previousBody = messageBodyBeforeLoad ?? ""
+        messageBodyLoadID = UUID()
+        messageBodyLoadTask?.cancel()
+        messageBodyLoadTask = nil
+        loadingMessageID = nil
+        messageBodyBeforeLoad = nil
+        if syncingAccount == accountEmail { syncingAccount = nil }
+        messages = messages.map { item in
+            guard item.id == messageID else { return item }
+            var updated = item
+            updated.body = previousBody
+            updated.bodyIsLoading = false
+            return updated
+        }
+    }
+
     func loadFullMessage(_ message: MailMessage, accountEmail: String?) async {
         guard message.isRemote, let account = accounts.first(where: { $0.email == accountEmail }),
               let password = try? KeychainStore.loadPassword(for: account.email) else { return }
@@ -668,17 +719,34 @@ final class MailStore: ObservableObject {
             if message.bodyIsHTML { setRemoteImagesAllowed(true, for: message.id) }
             return
         }
+        messageBodyLoadTask?.cancel()
+        let requestID = UUID()
+        messageBodyLoadID = requestID
+        loadingMessageID = message.id
+        messageBodyBeforeLoad = message.body
         markBodyLoading(message.id, loading: true, replaceWithPlaceholder: false)
         syncingAccount = account.email
-        defer { syncingAccount = nil }
+        defer {
+            if messageBodyLoadID == requestID {
+                messageBodyLoadTask = nil
+                loadingMessageID = nil
+                messageBodyBeforeLoad = nil
+                if syncingAccount == account.email { syncingAccount = nil }
+            }
+        }
         do {
-            let fetchedBody = try await GmailIMAPClient().fetchBody(
-                uid: message.id,
-                mailboxPath: message.mailboxPath,
-                email: account.email,
-                password: password,
-                full: true
-            )
+            let loadTask = Task {
+                try await GmailIMAPClient().fetchBody(
+                    uid: message.id,
+                    mailboxPath: message.mailboxPath,
+                    email: account.email,
+                    password: password,
+                    full: true
+                )
+            }
+            messageBodyLoadTask = loadTask
+            let fetchedBody = try await loadTask.value
+            guard messageBodyLoadID == requestID else { return }
             guard selectedAccount == account.email, selectedMailboxPath == message.mailboxPath else { return }
             messages = messages.map { item in
                 guard item.id == message.id else { return item }
@@ -691,6 +759,7 @@ final class MailStore: ObservableObject {
                 return updated
             }
         } catch {
+            guard messageBodyLoadID == requestID else { return }
             guard selectedAccount == account.email, selectedMailboxPath == message.mailboxPath else { return }
             accountErrors[account.email] = "Could not load the full message: \(error.localizedDescription)"
             activeError = accountErrors[account.email]
@@ -833,6 +902,15 @@ final class MailStore: ObservableObject {
         Task { await performBulkRemoteAction(.archive, messages: selectedMessages) }
     }
 
+    func toggleFlagSelectedMessages() {
+        guard isMultiSelectionActive else { return }
+        let messagesToUpdate = selectedMessages
+        guard !messagesToUpdate.isEmpty, messagesToUpdate.allSatisfy(\.isRemote) else { return }
+        Task {
+            await performBulkRemoteAction(.star(!messagesToUpdate.allSatisfy(\.flagged)), messages: messagesToUpdate)
+        }
+    }
+
     func moveSelectedMessages(to mailbox: MailMailbox) {
         guard isMultiSelectionActive else { return }
         Task { await performBulkRemoteAction(.move(mailbox.path), messages: selectedMessages) }
@@ -877,6 +955,7 @@ final class MailStore: ObservableObject {
 
     private enum BulkRemoteAction {
         case archive
+        case star(Bool)
         case move(String)
         case delete(isTrash: Bool, trashPath: String?)
     }
@@ -900,6 +979,8 @@ final class MailStore: ObservableObject {
             switch action {
             case .archive:
                 try await client.archive(uids: uids, mailboxPath: sourceMailbox, email: account.email, password: password)
+            case .star(let shouldStar):
+                try await client.setStarred(uids: uids, mailboxPath: sourceMailbox, starred: shouldStar, email: account.email, password: password)
             case .move(let destination):
                 try await client.move(uids: uids, from: sourceMailbox, to: destination, email: account.email, password: password)
             case .delete(let isTrash, let trashPath):
@@ -913,6 +994,13 @@ final class MailStore: ObservableObject {
             case .archive:
                 shouldRemoveFromCurrentMailbox = selectedMailbox?.isInbox == true
                 status = "Connected · \(messagesToActOn.count) messages archived"
+            case .star(let shouldStar):
+                shouldRemoveFromCurrentMailbox = selectedMailbox?.attributes.contains(where: {
+                    $0.caseInsensitiveCompare("\\Flagged") == .orderedSame
+                }) == true && !shouldStar
+                status = shouldStar
+                    ? "Connected · \(messagesToActOn.count) messages flagged"
+                    : "Connected · \(messagesToActOn.count) messages unflagged"
             case .move:
                 shouldRemoveFromCurrentMailbox = true
                 status = "Connected · \(messagesToActOn.count) messages moved"
@@ -924,6 +1012,13 @@ final class MailStore: ObservableObject {
             }
             if shouldRemoveFromCurrentMailbox {
                 removeFromCurrentMailbox(messageIDs, account: account)
+            } else if case .star(let shouldStar) = action {
+                messages = messages.map { item in
+                    guard messageIDs.contains(item.id) else { return item }
+                    var updated = item
+                    updated.flagged = shouldStar
+                    return updated
+                }
             }
             clearMultiSelection()
             accountStatuses[account.email] = status
