@@ -82,6 +82,7 @@ struct AccountSettingsView: View {
             .overlay(RoundedRectangle(cornerRadius: 12).stroke(Paper.border, lineWidth: 1))
 
             addressBookSection
+            inboxNotificationSection
             languageToolSection
 
             VStack(alignment: .leading, spacing: 12) {
@@ -172,6 +173,32 @@ struct AccountSettingsView: View {
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(Paper.border, lineWidth: 1))
     }
 
+    private var inboxNotificationSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "bell.badge").foregroundStyle(Paper.accent)
+                Text("Inbox Notifications").font(.system(size: 14, weight: .semibold))
+                Spacer()
+                Toggle("Notify for new inbox mail", isOn: Binding(
+                    get: { store.inboxNotificationsEnabled },
+                    set: { store.setInboxNotificationsEnabled($0) }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .accessibilityLabel("Notify for new inbox mail")
+            }
+            Text("HackMail watches the Inbox on each connected account using IMAP IDLE. Notifications use generic text and never show sender or subject.")
+                .font(.system(size: 11.5)).foregroundStyle(Paper.secondary).fixedSize(horizontal: false, vertical: true)
+            if store.inboxNotificationsEnabled && !store.inboxNotificationsAuthorized {
+                Text("Allow HackMail notifications in macOS System Settings to receive alerts. Inbox monitoring and refresh will still work without notification permission.")
+                    .font(.system(size: 10.5)).foregroundStyle(Paper.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(14)
+        .background(Paper.panel, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Paper.border, lineWidth: 1))
+    }
+
     private var isValidLanguageToolBaseURL: Bool {
         guard let components = URLComponents(string: store.languageToolBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             return false
@@ -203,7 +230,7 @@ struct AccountSettingsView: View {
                     .buttonStyle(.bordered).controlSize(.small)
                 }
             }
-             Text("Choose the macOS Contacts list to use for recipient suggestions. Suggestions search only that list.")
+            Text("Choose the macOS Contacts list to use for recipient suggestions. Suggestions search only that list.")
                 .font(.system(size: 11.5)).foregroundStyle(Paper.secondary).fixedSize(horizontal: false, vertical: true)
 
             if contactsAuthorizationStatus == .authorized && !contactsLists.isEmpty {

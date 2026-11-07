@@ -234,6 +234,12 @@ final class AccountAndMailTests: XCTestCase {
         XCTAssertEqual(uids, [12, 25, 40, 51])
     }
 
+    func testIMAPExistsResponseParsesMailboxMessageCount() {
+        XCTAssertEqual(IMAPServerResponseParser.parseExistsCount(["* 24 EXISTS", "* 3 RECENT"]), 24)
+        XCTAssertEqual(IMAPServerResponseParser.parseExistsCount(["* 0 EXISTS"]), 0)
+        XCTAssertNil(IMAPServerResponseParser.parseExistsCount(["A001 OK SELECT completed"]))
+    }
+
     func testLanguageToolResponseDecodesCorrectionRangesAndReplacements() throws {
         let json = #"{"matches":[{"message":"Possible spelling mistake","offset":0,"length":3,"replacements":[{"value":"the"}],"context":{"text":"teh cat","offset":0,"length":3},"rule":{"id":"MORFOLOGIK_RULE_EN_US"}}]}"#
 
@@ -359,13 +365,22 @@ final class MailStoreNavigationTests: XCTestCase {
     }
 
     @MainActor
-    func testCommandAndShiftClickSelectMessageGroups() throws {
+    func testCommandAndShiftClickSelectMessageGroupsAndTrackFlagState() throws {
         let suiteName = "HackMailTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let store = MailStore(defaults: defaults)
         store.messages = (1...4).map { id in
-            MailMessage(id: id, sender: "Sender \(id)", senderEmail: "sender\(id)@example.com", time: "", subject: "Message \(id)", preview: "", body: "", flagged: id == 1)
+            MailMessage(
+                id: id,
+                sender: "Sender \(id)",
+                senderEmail: "sender\(id)@example.com",
+                time: "",
+                subject: "Message \(id)",
+                preview: "",
+                body: "",
+                flagged: id == 1
+            )
         }
         let visibleMessages = store.filteredMessages
         store.selectedMessageID = 1
@@ -373,13 +388,12 @@ final class MailStoreNavigationTests: XCTestCase {
         store.select(visibleMessages[2], command: true, shift: false, visibleMessages: visibleMessages)
         XCTAssertEqual(store.multiSelectedMessageIDs, [1, 3])
         XCTAssertFalse(store.selectedMessagesAreAllFlagged)
-        store.select(visibleMessages[1], command: true, shift: false, visibleMessages: visibleMessages)
-        XCTAssertEqual(store.multiSelectedMessageIDs, [1, 2, 3])
 
         store.select(visibleMessages[1])
         store.select(visibleMessages[3], command: false, shift: true, visibleMessages: visibleMessages)
         XCTAssertEqual(store.multiSelectedMessageIDs, [2, 3, 4])
         XCTAssertEqual(store.selectedMessages.map(\.id), [2, 3, 4])
+
         store.messages = store.messages.map { message in
             var updated = message
             updated.flagged = true

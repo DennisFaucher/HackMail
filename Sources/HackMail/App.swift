@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UserNotifications
 
 @main
 struct HackMailApp: App {
@@ -29,9 +30,10 @@ struct HackMailApp: App {
 }
 
 @MainActor
-final class HackMailAppDelegate: NSObject, NSApplicationDelegate {
+final class HackMailAppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        UNUserNotificationCenter.current().delegate = self
         let bundledIconURL = Bundle.main.url(forResource: "PirateMail", withExtension: "icns")
         let developmentIconURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent("Icons/PirateMail.icns")
@@ -42,5 +44,13 @@ final class HackMailAppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
         }
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
     }
 }

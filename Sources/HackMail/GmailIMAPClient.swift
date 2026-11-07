@@ -30,6 +30,22 @@ struct GmailIMAPClient {
         }
     }
 
+    func waitForInboxChange(
+        email: String,
+        password: String,
+        knownMessageCount: Int?,
+        timeout: Duration = .seconds(1_500)
+    ) async throws -> InboxIdleUpdate {
+        try await withSession(email: email, password: password) { session in
+            let currentCount = try await session.selectMailboxAndGetMessageCount(path: "INBOX")
+            if let knownMessageCount, currentCount > knownMessageCount {
+                return InboxIdleUpdate(messageCount: currentCount, hasNewMessages: true)
+            }
+            let idleUpdate = try await session.waitForInboxExists(after: currentCount, timeout: timeout)
+            return InboxIdleUpdate(messageCount: idleUpdate.messageCount, hasNewMessages: idleUpdate.sawNewMessage)
+        }
+    }
+
     func fetchBody(uid: Int, mailboxPath: String, email: String, password: String, full: Bool = false, preferHTML: Bool = true) async throws -> FetchedMessageBody {
         try await withSession(email: email, password: password) { session in
             try await session.selectMailbox(path: mailboxPath)
@@ -145,6 +161,11 @@ struct MailboxSearchSnapshot: Sendable {
     let messages: [MailMessage]
 }
 
+struct InboxIdleUpdate: Sendable {
+    let messageCount: Int
+    let hasNewMessages: Bool
+}
+
 struct FetchedMessageBody: Sendable {
     let content: String
     let isHTML: Bool
@@ -191,6 +212,8 @@ private actor IMAPSession {
     private var buffered = Data()
     private var nextTag = 1
     private var capabilities: Set<String> = []
+    private var activeIdleTag: String?
+    private var didSendIdleDone = false
 
     func open(email: String, password: String) async throws {
         let endpoint = NWEndpoint.Host("imap.gmail.com")
@@ -264,11 +287,78 @@ private actor IMAPSession {
     }
 
     func selectMailbox(path: String) async throws {
+        _ = try await selectMailboxAndGetMessageCount(path: path)
+    }
+
+    func selectMailboxAndGetMessageCount(path: String) async throws -> Int {
         let selected = try await command("SELECT \(quote(path))")
         guard selected.lines.contains(where: { $0.localizedCaseInsensitiveContains("EXISTS") }) ||
                 selected.lines.contains(where: { $0.localizedCaseInsensitiveContains("READ-WRITE") }) else {
             throw IMAPError.protocolError("Could not select mailbox \(path).")
         }
+        return IMAPServerResponseParser.parseExistsCount(selected.lines) ?? 0
+    }
+
+    func waitForInboxExists(after initialCount: Int, timeout: Duration) async throws -> (messageCount: Int, sawNewMessage: Bool) {
+        try await loadCapabilities()
+        guard capabilities.contains("IDLE") else {
+            throw IMAPError.protocolError("This Gmail server does not support IMAP IDLE.")
+        }
+
+        let tag = String(format: "A%04d", nextTag)
+        nextTag += 1
+        activeIdleTag = tag
+        didSendIdleDone = false
+        try await send("\(tag) IDLE\r\n")
+        let continuation = try await readLine()
+        guard continuation.hasPrefix("+") else {
+            throw IMAPError.protocolError(continuation)
+        }
+
+        let timeoutTask = Task {
+            do {
+                try await Task.sleep(for: timeout)
+                try await self.finishIdle(tag: tag)
+            } catch is CancellationError {
+                return
+            } catch {
+                return
+            }
+        }
+        defer {
+            timeoutTask.cancel()
+            activeIdleTag = nil
+            didSendIdleDone = false
+        }
+
+        var latestCount = initialCount
+        var sawNewMessage = false
+        while true {
+            let line = try await readLine()
+            if line.uppercased().hasPrefix("* BYE") {
+                throw IMAPError.connection(line)
+            }
+            if let existsCount = IMAPServerResponseParser.parseExistsCount([line]) {
+                if existsCount > latestCount { sawNewMessage = true }
+                if existsCount > latestCount {
+                    try await finishIdle(tag: tag)
+                }
+                latestCount = existsCount
+            }
+            if line.hasPrefix("\(tag) ") {
+                let response = line.dropFirst(tag.count + 1).uppercased()
+                if response.hasPrefix("NO") || response.hasPrefix("BAD") {
+                    throw IMAPError.protocolError(line)
+                }
+                return (latestCount, sawNewMessage)
+            }
+        }
+    }
+
+    private func finishIdle(tag: String) async throws {
+        guard activeIdleTag == tag, !didSendIdleDone else { return }
+        didSendIdleDone = true
+        try await send("DONE\r\n")
     }
 
     func fetchBody(uid: Int, full: Bool, preferHTML: Bool) async throws -> FetchedMessageBody {
@@ -737,6 +827,18 @@ enum IMAPMIMEPartSelector {
 }
 
 enum IMAPServerResponseParser {
+    static func parseExistsCount(_ lines: [String]) -> Int? {
+        for line in lines {
+            let components = line.split(whereSeparator: \.isWhitespace)
+            guard components.count >= 3,
+                  components[0] == "*",
+                  components[2].caseInsensitiveCompare("EXISTS") == .orderedSame,
+                  let count = Int(components[1]) else { continue }
+            return count
+        }
+        return nil
+    }
+
     static func parseSearchUIDs(_ lines: [String]) -> [Int] {
         var seen = Set<Int>()
         return lines

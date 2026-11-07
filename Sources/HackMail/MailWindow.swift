@@ -82,6 +82,7 @@ struct MailWindow: View {
                 store.showSettings = true
                 return
             }
+            Task { await store.startInboxMonitoring() }
             guard let account = store.accounts.first, store.hasPassword(for: account) else { return }
             await store.refreshMailbox(for: account)
         }
@@ -394,14 +395,7 @@ private struct MailToolbar: View {
                     Text("\(store.selectedMessages.count) selected")
                         .font(.system(size: 11, weight: .medium)).foregroundStyle(Paper.secondary)
                         .lineLimit(1).fixedSize()
-                    Button { isShowingMoveMenu = true } label: {
-                        Image(systemName: "folder").font(.system(size: 14)).foregroundStyle(Paper.ink).frame(width: 32, height: 30)
-                    }
-                    .buttonStyle(.plain).fixedSize(horizontal: true, vertical: false).frame(width: 36, height: 30)
-                    .accessibilityLabel("Move selected messages to mailbox")
-                    .help("Move selected messages to mailbox")
-                    .disabled(!canApplyBulkAction || store.mailboxes.count < 2)
-                    .popover(isPresented: $isShowingMoveMenu, arrowEdge: .bottom) { moveMailboxPopover }
+                    moveMailboxButton
                     toolbarButton("archivebox", help: "Archive Selected Messages") { store.archiveSelectedMessages() }
                         .disabled(!canApplyBulkAction)
                     toolbarButton(
@@ -418,16 +412,7 @@ private struct MailToolbar: View {
             } else {
                 toolbarButton("archivebox", help: "Archive") { store.archiveSelected() }
                     .disabled(store.selectedMessage?.isRemote != true || store.syncingAccount != nil)
-                Button { isShowingMoveMenu = true } label: {
-                    Image(systemName: "folder").font(.system(size: 14)).foregroundStyle(Paper.ink).frame(width: 32, height: 30)
-                }
-                .buttonStyle(.plain)
-                .fixedSize(horizontal: true, vertical: false)
-                .frame(width: 40, height: 30)
-                .accessibilityLabel("Move to mailbox")
-                .help("Move to mailbox")
-                .disabled(store.selectedMessage?.isRemote != true || store.syncingAccount != nil || store.mailboxes.count < 2)
-                .popover(isPresented: $isShowingMoveMenu, arrowEdge: .bottom) { moveMailboxPopover }
+                moveMailboxButton
                 toolbarButton("trash", help: store.selectedMailbox?.isTrash == true ? "Delete Permanently" : "Move to Trash") { store.deleteSelected() }
                     .disabled(store.selectedMessage?.isRemote != true || store.syncingAccount != nil)
                 Rectangle().fill(Paper.border).frame(width: 1, height: 18).padding(.horizontal, 5)
@@ -453,6 +438,21 @@ private struct MailToolbar: View {
             .help(help)
     }
 
+    private var moveMailboxButton: some View {
+        Button { isShowingMoveMenu = true } label: {
+            Image(systemName: "folder").font(.system(size: 14)).foregroundStyle(Paper.ink).frame(width: 32, height: 30)
+        }
+        .buttonStyle(.plain)
+        .fixedSize(horizontal: true, vertical: false)
+        .frame(width: 40, height: 30)
+        .accessibilityLabel(store.isMultiSelectionActive ? "Move selected messages to mailbox" : "Move to mailbox")
+        .help(store.isMultiSelectionActive ? "Move selected messages to mailbox" : "Move to mailbox")
+        .disabled(store.isMultiSelectionActive
+            ? (!canApplyBulkAction || store.mailboxes.count < 2)
+            : (store.selectedMessage?.isRemote != true || store.syncingAccount != nil || store.mailboxes.count < 2))
+        .popover(isPresented: $isShowingMoveMenu, arrowEdge: .bottom) { moveMailboxPopover }
+    }
+
     private var canApplyBulkAction: Bool {
         !store.selectedMessages.isEmpty && store.selectedMessages.allSatisfy(\.isRemote) && store.syncingAccount == nil
     }
@@ -464,8 +464,7 @@ private struct MailToolbar: View {
             Text(store.isMultiSelectionActive
                 ? "Move \(store.selectedMessages.count) messages to…"
                 : "Move message to…")
-                .font(.system(size: 12, weight: .semibold))
-                .padding(.horizontal, 6)
+                .font(.system(size: 12, weight: .semibold)).padding(.horizontal, 6)
             Divider()
             ScrollView {
                 VStack(spacing: 2) {

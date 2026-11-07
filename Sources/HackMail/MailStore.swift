@@ -22,6 +22,8 @@ final class MailStore: ObservableObject {
     @Published var languageToolEnabled = false
     @Published var languageToolBaseURL = ""
     @Published var languageToolLanguage = "en-US"
+    @Published var inboxNotificationsEnabled = true
+    @Published private(set) var inboxNotificationsAuthorized = false
     @Published var isComposing = false
     @Published var composeTitle = "New Message"
     @Published var composeTo = ""
@@ -49,6 +51,7 @@ final class MailStore: ObservableObject {
     private let languageToolEnabledKey = "language-tool-enabled-v2"
     private let languageToolBaseURLKey = "language-tool-base-url"
     private let languageToolLanguageKey = "language-tool-language"
+    private let inboxNotificationsEnabledKey = "inbox-notifications-enabled"
     private let defaults: UserDefaults
     private var composePreparationID = UUID()
     private var searchRequestID = UUID()
@@ -57,6 +60,8 @@ final class MailStore: ObservableObject {
     private var messageBodyLoadID = UUID()
     private var messageBodyLoadTask: Task<FetchedMessageBody, Error>?
     private var messageBodyBeforeLoad: String?
+    private var inboxMonitorTasks: [String: Task<Void, Never>] = [:]
+    private var inboxMonitorIDs: [String: UUID] = [:]
 
     static let defaultLanguageToolBaseURL = ""
 
@@ -66,6 +71,7 @@ final class MailStore: ObservableObject {
         languageToolEnabled = defaults.object(forKey: languageToolEnabledKey) as? Bool ?? false
         languageToolBaseURL = defaults.string(forKey: languageToolBaseURLKey) ?? Self.defaultLanguageToolBaseURL
         languageToolLanguage = defaults.string(forKey: languageToolLanguageKey) ?? "en-US"
+        inboxNotificationsEnabled = defaults.object(forKey: inboxNotificationsEnabledKey) as? Bool ?? true
         if let data = defaults.data(forKey: accountsKey),
            let saved = try? JSONDecoder().decode([MailAccount].self, from: data) {
             accounts = saved
@@ -415,6 +421,10 @@ final class MailStore: ObservableObject {
             resetSearchState()
         }
         persistAccounts()
+        stopInboxMonitoring(for: normalizedEmail)
+        Task {
+            await startInboxMonitoring()
+        }
     }
 
     func selectContactsContainer(_ identifier: String?) {
@@ -432,7 +442,82 @@ final class MailStore: ObservableObject {
         defaults.set(languageToolLanguage, forKey: languageToolLanguageKey)
     }
 
+    func setInboxNotificationsEnabled(_ enabled: Bool) {
+        inboxNotificationsEnabled = enabled
+        defaults.set(enabled, forKey: inboxNotificationsEnabledKey)
+        if enabled {
+            Task { await startInboxMonitoring() }
+        }
+    }
+
+    func startInboxMonitoring() async {
+        for account in accounts where hasPassword(for: account) {
+            guard inboxMonitorTasks[account.email] == nil else { continue }
+            let email = account.email
+            let monitorID = UUID()
+            inboxMonitorIDs[email] = monitorID
+            inboxMonitorTasks[email] = Task { [weak self] in
+                guard let self else { return }
+                await self.monitorInbox(for: email)
+                guard self.inboxMonitorIDs[email] == monitorID else { return }
+                self.inboxMonitorIDs[email] = nil
+                self.inboxMonitorTasks[email] = nil
+            }
+        }
+        if inboxNotificationsEnabled, !inboxMonitorTasks.isEmpty {
+            inboxNotificationsAuthorized = await InboxNotificationService.requestAuthorization()
+        }
+    }
+
+    private func monitorInbox(for email: String) async {
+        var knownMessageCount: Int?
+        var retryDelay: Double = 5
+        while !Task.isCancelled {
+            guard let account = accounts.first(where: { $0.email == email }),
+                  let password = try? KeychainStore.loadPassword(for: account.email) else { return }
+            do {
+                let update = try await GmailIMAPClient().waitForInboxChange(
+                    email: account.email,
+                    password: password,
+                    knownMessageCount: knownMessageCount
+                )
+                guard !Task.isCancelled else { return }
+                let previousCount = knownMessageCount
+                knownMessageCount = update.messageCount
+                retryDelay = 5
+
+                guard update.hasNewMessages else { continue }
+                let newMessageCount = max(1, previousCount.map { update.messageCount - $0 } ?? 1)
+                if inboxNotificationsEnabled && inboxNotificationsAuthorized {
+                    await InboxNotificationService.postNewMessages(count: newMessageCount)
+                }
+                let selectedMailboxIsInbox = selectedMailbox?.isInbox == true ||
+                    selectedMailboxPath.caseInsensitiveCompare("INBOX") == .orderedSame
+                if selectedAccount == account.email, selectedMailboxIsInbox {
+                    while syncingAccount != nil && !Task.isCancelled {
+                        try? await Task.sleep(for: .milliseconds(250))
+                    }
+                    guard !Task.isCancelled, selectedAccount == account.email,
+                          selectedMailboxPath.caseInsensitiveCompare("INBOX") == .orderedSame else { continue }
+                    await refreshMailbox(for: account)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                try? await Task.sleep(for: .seconds(retryDelay))
+                retryDelay = min(retryDelay * 2, 120)
+            }
+        }
+    }
+
+    private func stopInboxMonitoring(for email: String) {
+        inboxMonitorIDs[email] = nil
+        inboxMonitorTasks.removeValue(forKey: email)?.cancel()
+    }
+
     func removeAccount(_ account: MailAccount) {
+        stopInboxMonitoring(for: account.email)
         KeychainStore.delete(for: account.email)
         let wasSelected = selectedAccount == account.email
         accounts.removeAll { $0.id == account.id }
