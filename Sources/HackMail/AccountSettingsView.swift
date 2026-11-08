@@ -187,8 +187,17 @@ struct AccountSettingsView: View {
                 .labelsHidden()
                 .accessibilityLabel("Notify for new inbox mail")
             }
-            Text("HackMail watches the Inbox on each connected account using IMAP IDLE. Notifications use generic text and never show sender or subject.")
+            Text("HackMail watches the Inbox on each connected account using IMAP IDLE. Notifications show the subject only, never the sender or body. The Dock badge shows the combined unread count; selecting an unread message marks it as read in Gmail.")
                 .font(.system(size: 11.5)).foregroundStyle(Paper.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Text("Unread Inbox total")
+                Spacer()
+                Text("\(store.totalUnreadInboxCount)")
+                    .monospacedDigit()
+                    .fontWeight(.semibold)
+            }
+            .font(.system(size: 11.5))
+            .foregroundStyle(Paper.secondary)
             if store.inboxNotificationsEnabled && !store.inboxNotificationsAuthorized {
                 Text("Allow HackMail notifications in macOS System Settings to receive alerts. Inbox monitoring and refresh will still work without notification permission.")
                     .font(.system(size: 10.5)).foregroundStyle(Paper.secondary).fixedSize(horizontal: false, vertical: true)

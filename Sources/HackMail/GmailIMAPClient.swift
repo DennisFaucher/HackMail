@@ -34,15 +34,72 @@ struct GmailIMAPClient {
         email: String,
         password: String,
         knownMessageCount: Int?,
+        knownLatestUID: Int?,
         timeout: Duration = .seconds(1_500)
     ) async throws -> InboxIdleUpdate {
         try await withSession(email: email, password: password) { session in
             let currentCount = try await session.selectMailboxAndGetMessageCount(path: "INBOX")
-            if let knownMessageCount, currentCount > knownMessageCount {
-                return InboxIdleUpdate(messageCount: currentCount, hasNewMessages: true)
+            let unreadCount = try await session.unseenMessageCount()
+            let currentUIDs = try await session.searchUIDs(after: knownLatestUID)
+            if let knownLatestUID, !currentUIDs.isEmpty {
+                let headers = try await session.fetchMessages(uids: Array(currentUIDs.suffix(5)), mailboxPath: "INBOX")
+                return InboxIdleUpdate(
+                    messageCount: currentCount,
+                    unreadCount: unreadCount,
+                    hasNewMessages: true,
+                    hasMailboxChange: true,
+                    newestUID: currentUIDs.max() ?? knownLatestUID,
+                    newMessageCount: currentUIDs.count,
+                    newSubjects: headers.map(\.subject)
+                )
             }
+            if knownLatestUID != nil, currentUIDs.isEmpty,
+               let knownMessageCount, currentCount > knownMessageCount {
+                let allUIDs = try await session.searchUIDs(after: nil)
+                let count = max(1, currentCount - knownMessageCount)
+                let fallbackUIDs = Array(allUIDs.suffix(min(count, 5)))
+                let headers = try await session.fetchMessages(uids: fallbackUIDs, mailboxPath: "INBOX")
+                return InboxIdleUpdate(
+                    messageCount: currentCount,
+                    unreadCount: unreadCount,
+                    hasNewMessages: true,
+                    hasMailboxChange: true,
+                    newestUID: allUIDs.max(),
+                    newMessageCount: count,
+                    newSubjects: headers.map(\.subject)
+                )
+            }
+            let startingUID = knownLatestUID ?? currentUIDs.max()
             let idleUpdate = try await session.waitForInboxExists(after: currentCount, timeout: timeout)
-            return InboxIdleUpdate(messageCount: idleUpdate.messageCount, hasNewMessages: idleUpdate.sawNewMessage)
+            var newUIDs = try await session.searchUIDs(after: startingUID)
+            var newMessageCount = newUIDs.count
+            var newestUID = newUIDs.max() ?? startingUID
+            if newUIDs.isEmpty, idleUpdate.sawNewMessage {
+                let allUIDs = try await session.searchUIDs(after: nil)
+                newMessageCount = max(1, idleUpdate.messageCount - currentCount)
+                newUIDs = Array(allUIDs.suffix(min(newMessageCount, 5)))
+                newestUID = allUIDs.max() ?? startingUID
+            }
+            let headers = try await session.fetchMessages(uids: Array(newUIDs.suffix(5)), mailboxPath: "INBOX")
+            let latestUnreadCount = try await session.unseenMessageCount()
+            return InboxIdleUpdate(
+                messageCount: idleUpdate.messageCount,
+                unreadCount: latestUnreadCount,
+                hasNewMessages: idleUpdate.sawNewMessage || !newUIDs.isEmpty,
+                hasMailboxChange: idleUpdate.hasMailboxChange || !newUIDs.isEmpty,
+                newestUID: newestUID,
+                newMessageCount: newMessageCount,
+                newSubjects: headers.map(\.subject)
+            )
+        }
+    }
+
+    func fetchInboxMonitorState(email: String, password: String) async throws -> InboxMonitorState {
+        try await withSession(email: email, password: password) { session in
+            let messageCount = try await session.selectMailboxAndGetMessageCount(path: "INBOX")
+            let unreadCount = try await session.unseenMessageCount()
+            let latestUID = try await session.searchUIDs(after: nil).max()
+            return InboxMonitorState(messageCount: messageCount, unreadCount: unreadCount, latestUID: latestUID)
         }
     }
 
@@ -64,6 +121,13 @@ struct GmailIMAPClient {
         try await withSession(email: email, password: password, shouldLogout: false) { session in
             try await session.selectMailbox(path: mailboxPath)
             try await session.setStarred(uid: uid, starred: starred)
+        }
+    }
+
+    func markAsRead(uid: Int, mailboxPath: String, email: String, password: String) async throws {
+        try await withSession(email: email, password: password) { session in
+            try await session.selectMailbox(path: mailboxPath)
+            try await session.markAsRead(uid: uid)
         }
     }
 
@@ -163,7 +227,18 @@ struct MailboxSearchSnapshot: Sendable {
 
 struct InboxIdleUpdate: Sendable {
     let messageCount: Int
+    let unreadCount: Int
     let hasNewMessages: Bool
+    let hasMailboxChange: Bool
+    let newestUID: Int?
+    let newMessageCount: Int
+    let newSubjects: [String]
+}
+
+struct InboxMonitorState: Sendable {
+    let messageCount: Int
+    let unreadCount: Int
+    let latestUID: Int?
 }
 
 struct FetchedMessageBody: Sendable {
@@ -264,11 +339,26 @@ private actor IMAPSession {
 
     func fetchMailbox(path: String, limit: Int) async throws -> [MailMessage] {
         try await selectMailbox(path: path)
-        let search = try await command("UID SEARCH ALL")
-        let uids = IMAPServerResponseParser.parseSearchUIDs(search.lines).suffix(max(1, limit))
+        let uids = try await searchUIDs(after: nil).suffix(max(1, limit))
         guard !uids.isEmpty else { return [] }
 
         return try await fetchMessages(uids: Array(uids), mailboxPath: path)
+    }
+
+    func searchUIDs(after lastUID: Int?) async throws -> [Int] {
+        let searchCommand: String
+        if let lastUID, lastUID >= 0, lastUID < Int(UInt32.max) {
+            searchCommand = "UID SEARCH UID \(lastUID + 1):*"
+        } else {
+            searchCommand = "UID SEARCH ALL"
+        }
+        let response = try await command(searchCommand)
+        return IMAPServerResponseParser.parseSearchUIDs(response.lines, greaterThan: lastUID)
+    }
+
+    func unseenMessageCount() async throws -> Int {
+        let response = try await command("UID SEARCH UNSEEN")
+        return IMAPServerResponseParser.parseSearchUIDs(response.lines).count
     }
 
     func searchMailbox(path: String, query: String) async throws -> [Int] {
@@ -299,7 +389,7 @@ private actor IMAPSession {
         return IMAPServerResponseParser.parseExistsCount(selected.lines) ?? 0
     }
 
-    func waitForInboxExists(after initialCount: Int, timeout: Duration) async throws -> (messageCount: Int, sawNewMessage: Bool) {
+    func waitForInboxExists(after initialCount: Int, timeout: Duration) async throws -> (messageCount: Int, sawNewMessage: Bool, hasMailboxChange: Bool) {
         try await loadCapabilities()
         guard capabilities.contains("IDLE") else {
             throw IMAPError.protocolError("This Gmail server does not support IMAP IDLE.")
@@ -333,24 +423,31 @@ private actor IMAPSession {
 
         var latestCount = initialCount
         var sawNewMessage = false
+        var hasMailboxChange = false
         while true {
             let line = try await readLine()
             if line.uppercased().hasPrefix("* BYE") {
                 throw IMAPError.connection(line)
             }
             if let existsCount = IMAPServerResponseParser.parseExistsCount([line]) {
-                if existsCount > latestCount { sawNewMessage = true }
-                if existsCount > latestCount {
+                if existsCount != latestCount {
+                    hasMailboxChange = true
+                    if existsCount > latestCount { sawNewMessage = true }
                     try await finishIdle(tag: tag)
                 }
                 latestCount = existsCount
+            }
+            let uppercasedLine = line.uppercased()
+            if (uppercasedLine.contains(" FETCH ") && uppercasedLine.contains(" FLAGS ")) || uppercasedLine.contains(" EXPUNGE") {
+                hasMailboxChange = true
+                try await finishIdle(tag: tag)
             }
             if line.hasPrefix("\(tag) ") {
                 let response = line.dropFirst(tag.count + 1).uppercased()
                 if response.hasPrefix("NO") || response.hasPrefix("BAD") {
                     throw IMAPError.protocolError(line)
                 }
-                return (latestCount, sawNewMessage)
+                return (latestCount, sawNewMessage, hasMailboxChange)
             }
         }
     }
@@ -469,6 +566,10 @@ private actor IMAPSession {
         guard let uidSet = makeUIDSet(uids) else { return }
         let operation = starred ? "+FLAGS.SILENT" : "-FLAGS.SILENT"
         _ = try await command("UID STORE \(uidSet) \(operation) (\\Flagged)")
+    }
+
+    func markAsRead(uid: Int) async throws {
+        _ = try await command("UID STORE \(uid) +FLAGS.SILENT (\\Seen)")
     }
 
     func move(uid: Int, to destination: String) async throws {
@@ -827,6 +928,12 @@ enum IMAPMIMEPartSelector {
 }
 
 enum IMAPServerResponseParser {
+    static func parseSearchUIDs(_ lines: [String], greaterThan lastUID: Int?) -> [Int] {
+        let uids = parseSearchUIDs(lines)
+        guard let lastUID else { return uids }
+        return uids.filter { $0 > lastUID }
+    }
+
     static func parseExistsCount(_ lines: [String]) -> Int? {
         for line in lines {
             let components = line.split(whereSeparator: \.isWhitespace)

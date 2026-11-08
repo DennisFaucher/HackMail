@@ -234,6 +234,17 @@ final class AccountAndMailTests: XCTestCase {
         XCTAssertEqual(uids, [12, 25, 40, 51])
     }
 
+    func testIDLEUIDSearchFiltersOutThePreviousHighestUID() {
+        XCTAssertEqual(
+            IMAPServerResponseParser.parseSearchUIDs(["* SEARCH 120 121"], greaterThan: 121),
+            []
+        )
+        XCTAssertEqual(
+            IMAPServerResponseParser.parseSearchUIDs(["* SEARCH 120 121 122 123"], greaterThan: 121),
+            [122, 123]
+        )
+    }
+
     func testIMAPExistsResponseParsesMailboxMessageCount() {
         XCTAssertEqual(IMAPServerResponseParser.parseExistsCount(["* 24 EXISTS", "* 3 RECENT"]), 24)
         XCTAssertEqual(IMAPServerResponseParser.parseExistsCount(["* 0 EXISTS"]), 0)
@@ -259,6 +270,27 @@ final class AccountAndMailTests: XCTestCase {
         )
         XCTAssertNil(LanguageToolClient.checkEndpoint(from: "http://languagetool.example/v2/"))
         XCTAssertNil(LanguageToolClient.checkEndpoint(from: "https://user:secret@languagetool.example/v2/"))
+    }
+
+    func testInboxNotificationUsesSubjectWithoutSenderDetails() {
+        XCTAssertEqual(
+            InboxNotificationService.notificationBody(subjects: [" Project update "], additionalCount: 0),
+            "Project update"
+        )
+        XCTAssertEqual(
+            InboxNotificationService.notificationBody(subjects: ["Invoice", "Second"], additionalCount: 1),
+            "Invoice (+1 more)"
+        )
+        XCTAssertEqual(
+            InboxNotificationService.notificationBody(subjects: [""], additionalCount: 0),
+            "New mail has arrived in one of your Inboxes."
+        )
+    }
+
+    func testDockBadgeOmitsZeroAndFormatsUnreadCount() {
+        XCTAssertNil(DockBadgeFormatter.label(for: 0))
+        XCTAssertNil(DockBadgeFormatter.label(for: -1))
+        XCTAssertEqual(DockBadgeFormatter.label(for: 7), "7")
     }
 
     @MainActor

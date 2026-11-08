@@ -45,12 +45,15 @@ stylesheets, and attachments remain blocked.
 CID-referenced inline images bundled inside a message are resolved in memory; this does not contact
 the image host.
 While HackMail is running, Gmail IMAP IDLE watches each configured Inbox and refreshes the selected
-Inbox when new mail arrives. Generic macOS notifications are enabled by default; notification
-permission can be changed in **Mail → Mail Accounts…**.
+Inbox when new mail arrives. macOS notifications are enabled by default and show the message subject,
+but not the sender or body. The Dock badge shows the combined unread count for configured Inboxes.
+Selecting an unread message marks it as read in Gmail, and the Dock badge follows the updated unread
+count. Notification permission can be changed in **Mail → Mail Accounts…**.
 Folders and incoming messages are held in memory only; there is no offline email cache or inbound
 attachment download feature. Search queries use Gmail's search syntax and are executed server-side
 against the selected folder; matching headers are loaded in pages. Remote folder navigation, star,
-archive, move, and delete operations are implemented. Click the message-list headers to sort by
+archive, move, and delete operations are implemented, including multi-select actions over Gmail IMAP.
+Click the message-list headers to sort by
 starred state, subject, sender, or date; the selected sort order also applies as search pages load.
 Compose now supports basic rich formatting, HTML plus plain-text alternatives, and
 outgoing file attachments (18 MiB aggregate limit); selected files are read into memory for sending

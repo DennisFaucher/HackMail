@@ -123,3 +123,9 @@ enum MessageSortDirection: Sendable {
         self == .ascending ? "chevron.up" : "chevron.down"
     }
 }
+
+enum DockBadgeFormatter {
+    static func label(for unreadCount: Int) -> String? {
+        unreadCount > 0 ? String(unreadCount) : nil
+    }
+}

@@ -24,6 +24,7 @@ final class MailStore: ObservableObject {
     @Published var languageToolLanguage = "en-US"
     @Published var inboxNotificationsEnabled = true
     @Published private(set) var inboxNotificationsAuthorized = false
+    @Published private(set) var unreadInboxCounts: [String: Int] = [:]
     @Published var isComposing = false
     @Published var composeTitle = "New Message"
     @Published var composeTo = ""
@@ -62,6 +63,7 @@ final class MailStore: ObservableObject {
     private var messageBodyBeforeLoad: String?
     private var inboxMonitorTasks: [String: Task<Void, Never>] = [:]
     private var inboxMonitorIDs: [String: UUID] = [:]
+    private var markingReadMessageKeys: Set<String> = []
 
     static let defaultLanguageToolBaseURL = ""
 
@@ -138,6 +140,10 @@ final class MailStore: ObservableObject {
 
     var selectedMessagesAreAllFlagged: Bool {
         !selectedMessages.isEmpty && selectedMessages.allSatisfy(\.flagged)
+    }
+
+    var totalUnreadInboxCount: Int {
+        unreadInboxCounts.values.reduce(0, +)
     }
 
     func isMessageSelected(_ messageID: Int) -> Bool {
@@ -471,29 +477,43 @@ final class MailStore: ObservableObject {
 
     private func monitorInbox(for email: String) async {
         var knownMessageCount: Int?
+        var knownLatestUID: Int?
+        var hasInitialState = false
         var retryDelay: Double = 5
         while !Task.isCancelled {
             guard let account = accounts.first(where: { $0.email == email }),
                   let password = try? KeychainStore.loadPassword(for: account.email) else { return }
             do {
+                if !hasInitialState {
+                    let state = try await GmailIMAPClient().fetchInboxMonitorState(email: account.email, password: password)
+                    guard !Task.isCancelled else { return }
+                    knownMessageCount = state.messageCount
+                    knownLatestUID = state.latestUID
+                    setUnreadInboxCount(state.unreadCount, for: account.email)
+                    hasInitialState = true
+                }
                 let update = try await GmailIMAPClient().waitForInboxChange(
                     email: account.email,
                     password: password,
-                    knownMessageCount: knownMessageCount
+                    knownMessageCount: knownMessageCount,
+                    knownLatestUID: knownLatestUID
                 )
                 guard !Task.isCancelled else { return }
-                let previousCount = knownMessageCount
                 knownMessageCount = update.messageCount
+                knownLatestUID = update.newestUID ?? knownLatestUID
+                setUnreadInboxCount(update.unreadCount, for: account.email)
                 retryDelay = 5
 
-                guard update.hasNewMessages else { continue }
-                let newMessageCount = max(1, previousCount.map { update.messageCount - $0 } ?? 1)
-                if inboxNotificationsEnabled && inboxNotificationsAuthorized {
-                    await InboxNotificationService.postNewMessages(count: newMessageCount)
+                if update.hasNewMessages && inboxNotificationsEnabled && inboxNotificationsAuthorized {
+                    let newMessageCount = max(1, update.newMessageCount)
+                    await InboxNotificationService.postNewMail(
+                        subjects: update.newSubjects,
+                        additionalCount: max(0, newMessageCount - update.newSubjects.count)
+                    )
                 }
                 let selectedMailboxIsInbox = selectedMailbox?.isInbox == true ||
                     selectedMailboxPath.caseInsensitiveCompare("INBOX") == .orderedSame
-                if selectedAccount == account.email, selectedMailboxIsInbox {
+                if update.hasMailboxChange, selectedAccount == account.email, selectedMailboxIsInbox {
                     while syncingAccount != nil && !Task.isCancelled {
                         try? await Task.sleep(for: .milliseconds(250))
                     }
@@ -516,8 +536,19 @@ final class MailStore: ObservableObject {
         inboxMonitorTasks.removeValue(forKey: email)?.cancel()
     }
 
+    private func setUnreadInboxCount(_ count: Int, for email: String) {
+        unreadInboxCounts[email] = max(0, count)
+        updateDockBadge()
+    }
+
+    private func updateDockBadge() {
+        HackMailAppDelegate.updateDockBadge(unreadCount: totalUnreadInboxCount)
+    }
+
     func removeAccount(_ account: MailAccount) {
         stopInboxMonitoring(for: account.email)
+        unreadInboxCounts.removeValue(forKey: account.email)
+        updateDockBadge()
         KeychainStore.delete(for: account.email)
         let wasSelected = selectedAccount == account.email
         accounts.removeAll { $0.id == account.id }
@@ -927,10 +958,53 @@ final class MailStore: ObservableObject {
                 updated.unread = false
                 return updated
             }
+        } else if message.unread {
+            markRemoteMessageAsRead(message, accountEmail: selectedAccount)
         }
         if message.isRemote && message.body.isEmpty {
             let accountEmail = selectedAccount
             Task { await loadBody(for: message, accountEmail: accountEmail) }
+        }
+    }
+
+    private func markRemoteMessageAsRead(_ message: MailMessage, accountEmail: String?) {
+        guard message.isRemote,
+              let account = accounts.first(where: { $0.email == accountEmail }),
+              let password = try? KeychainStore.loadPassword(for: account.email) else { return }
+
+        let key = "\(account.email.lowercased())|\(message.mailboxPath)|\(message.id)"
+        guard markingReadMessageKeys.insert(key).inserted else { return }
+
+        Task {
+            defer { markingReadMessageKeys.remove(key) }
+            do {
+                let client = GmailIMAPClient()
+                try await client.markAsRead(
+                    uid: message.id,
+                    mailboxPath: message.mailboxPath,
+                    email: account.email,
+                    password: password
+                )
+
+                if selectedAccount == account.email, selectedMailboxPath == message.mailboxPath {
+                    messages = messages.map { item in
+                        guard item.id == message.id, item.mailboxPath == message.mailboxPath else { return item }
+                        var updated = item
+                        updated.unread = false
+                        return updated
+                    }
+                }
+
+                if message.mailboxPath.caseInsensitiveCompare("INBOX") == .orderedSame,
+                   let state = try? await client.fetchInboxMonitorState(email: account.email, password: password) {
+                    setUnreadInboxCount(state.unreadCount, for: account.email)
+                }
+            } catch {
+                guard selectedAccount == account.email, selectedMailboxPath == message.mailboxPath else { return }
+                let detail = "Could not mark message as read: \(error.localizedDescription)"
+                accountErrors[account.email] = detail
+                activeError = detail
+            }
         }
     }
 
