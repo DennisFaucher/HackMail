@@ -47,7 +47,7 @@ attachment download feature.
 * Search queries use Gmail's search syntax and are executed server-side against the selected folder; matching headers are loaded in pages.
 * Remote folder navigation, star, archive, move, and delete operations are implemented, including multi-select actions over Gmail IMAP.
 * Click the message-list headers to sort by starred state, subject, sender, or date; the selected sort order also applies as search pages load.
-* Compose now supports basic rich formatting, HTML plus plain-text alternatives, and outgoing file attachments (18 MiB aggregate limit); selected files are read into memory for sending and are not copied into app storage.
+* Compose now supports basic rich formatting, HTML plus plain-text alternatives, and outgoing file attachments (18 MiB aggregate limit); selected files are read into memory for sending and are not copied into app storage. Each account can have its own optional email signature in Settings; it is inserted into new messages, replies, and forwards and remains editable in the draft.
 * Reply/forward preparation fetches incomplete source bodies in the background, preserves the sanitized HTML original in a formatted quote, and supplies a bounded plain-text alternative to keep large-message preparation responsive.
 * Bundled CID images are sent as inline related MIME parts; remote images remain subject to the reader's opt-in.
 * Recipient autocomplete can search a user-selected macOS Contacts list after explicit Contacts permission; contact details are held in memory for the active compose session and are not saved by HackMail.

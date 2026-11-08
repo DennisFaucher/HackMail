@@ -4,27 +4,32 @@ struct MailAccount: Identifiable, Codable, Equatable {
     var id: String { email.lowercased() }
     var email: String
     var fullName: String
+    var signature: String
 
-    init(email: String, fullName: String? = nil) {
+    init(email: String, fullName: String? = nil, signature: String = "") {
         self.email = email
         self.fullName = fullName ?? ""
+        self.signature = signature
     }
 
     private enum CodingKeys: String, CodingKey {
         case email
         case fullName
+        case signature
     }
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         email = try values.decode(String.self, forKey: .email)
         fullName = try values.decodeIfPresent(String.self, forKey: .fullName) ?? ""
+        signature = try values.decodeIfPresent(String.self, forKey: .signature) ?? ""
     }
 
     func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(email, forKey: .email)
         try values.encode(fullName, forKey: .fullName)
+        try values.encode(signature, forKey: .signature)
     }
 }
 
@@ -127,5 +132,13 @@ enum MessageSortDirection: Sendable {
 enum DockBadgeFormatter {
     static func label(for unreadCount: Int) -> String? {
         unreadCount > 0 ? String(unreadCount) : nil
+    }
+}
+
+enum MailSignatureFormatter {
+    static func draftBody(for signature: String) -> NSAttributedString {
+        let trimmedSignature = signature.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedSignature.isEmpty else { return NSAttributedString(string: "") }
+        return NSAttributedString(string: "\n\n-- \n\(trimmedSignature)\n")
     }
 }

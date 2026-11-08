@@ -7,13 +7,22 @@ final class AccountAndMailTests: XCTestCase {
         let accounts = try JSONDecoder().decode([MailAccount].self, from: Data(legacyJSON.utf8))
 
         XCTAssertEqual(accounts.map(\.fullName), ["", ""])
+        XCTAssertEqual(accounts.map(\.signature), ["", ""])
     }
 
     func testFullNameRoundTripsWithAccountSettings() throws {
-        let account = MailAccount(email: "sender@example.com", fullName: "Example Sender")
+        let account = MailAccount(email: "sender@example.com", fullName: "Example Sender", signature: "Thanks,\nAlex")
         let decoded = try JSONDecoder().decode(MailAccount.self, from: JSONEncoder().encode(account))
 
         XCTAssertEqual(decoded, account)
+    }
+
+    func testSignatureDraftFormattingAndEmptySignature() {
+        XCTAssertEqual(
+            MailSignatureFormatter.draftBody(for: "  Thanks,\nAlex  ").string,
+            "\n\n-- \nThanks,\nAlex\n"
+        )
+        XCTAssertEqual(MailSignatureFormatter.draftBody(for: " \n ").string, "")
     }
 
     func testRecipientParserAcceptsCommaAndSemicolonSeparators() {
@@ -332,6 +341,21 @@ final class AccountAndMailTests: XCTestCase {
 }
 
 final class MailStoreNavigationTests: XCTestCase {
+    @MainActor
+    func testNewMessageStartsWithSelectedAccountsSignature() throws {
+        let suiteName = "HackMailTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = MailStore(defaults: defaults)
+        let account = MailAccount(email: "sender@example.test", signature: "Regards,\nAlex")
+        store.accounts = [account]
+        store.selectedAccount = account.email
+
+        store.beginNewMessage()
+
+        XCTAssertEqual(store.composeBody.string, "\n\n-- \nRegards,\nAlex\n")
+    }
+
     @MainActor
     func testMailStoreStartsWithAnEmptyLiveMessageList() throws {
         let suiteName = "HackMailTests.\(UUID().uuidString)"

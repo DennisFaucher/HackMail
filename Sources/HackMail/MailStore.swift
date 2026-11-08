@@ -180,7 +180,8 @@ final class MailStore: ObservableObject {
         composeTitle = "New Message"
         composeTo = ""
         composeSubject = ""
-        composeBody = NSAttributedString(string: "")
+        let signature = accounts.first(where: { $0.email == selectedAccount })?.signature ?? ""
+        composeBody = MailSignatureFormatter.draftBody(for: signature)
         composeAttachments = []
         composeBodyWasTruncated = false
         quotedMessage = nil
@@ -370,7 +371,8 @@ final class MailStore: ObservableObject {
             isHTML ? HTMLTextExtractor.extract(originalBody) : HTMLTextExtractor.limitPlainText(originalBody)
         }.value
         guard composePreparationID == preparationID else { return }
-        composeBody = NSAttributedString(string: "")
+        let signature = accounts.first(where: { $0.email == accountEmail })?.signature ?? ""
+        composeBody = MailSignatureFormatter.draftBody(for: signature)
         quotedPlainText = result.text
         composeBodyWasTruncated = result.wasTruncated
         composePreparationMessage = ""
@@ -379,6 +381,8 @@ final class MailStore: ObservableObject {
 
     private func failQuotePreparation(_ message: String, preparationID: UUID) {
         guard composePreparationID == preparationID else { return }
+        let signature = accounts.first(where: { $0.email == selectedAccount })?.signature ?? ""
+        composeBody = MailSignatureFormatter.draftBody(for: signature)
         composePreparationError = message
         composePreparationMessage = ""
         isPreparingCompose = false
@@ -401,7 +405,7 @@ final class MailStore: ObservableObject {
         return "<html><body><pre>\(escaped)</pre></body></html>"
     }
 
-    func saveAccount(email: String, fullName: String, password: String?) throws {
+    func saveAccount(email: String, fullName: String, signature: String = "", password: String?) throws {
         let normalizedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let normalizedName = fullName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalizedName.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
@@ -413,9 +417,10 @@ final class MailStore: ObservableObject {
         }
         if let index = accounts.firstIndex(where: { $0.email.caseInsensitiveCompare(normalizedEmail) == .orderedSame }) {
             accounts[index].fullName = normalizedName
+            accounts[index].signature = signature
         } else {
             guard let password, !password.isEmpty else { throw MailComposerError.missingPassword }
-            accounts.append(MailAccount(email: normalizedEmail, fullName: normalizedName))
+            accounts.append(MailAccount(email: normalizedEmail, fullName: normalizedName, signature: signature))
         }
         if selectedAccount != normalizedEmail {
             selectedAccount = normalizedEmail

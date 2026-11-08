@@ -41,6 +41,7 @@ struct RichTextEditor: NSViewRepresentable {
         textView.typingAttributes[.font] = font
         textView.typingAttributes[.foregroundColor] = NSColor(Paper.ink)
         textView.textStorage?.setAttributedString(text)
+        textView.setSelectedRange(NSRange(location: 0, length: 0))
         textView.delegate = context.coordinator
 
         let scrollView = NSScrollView()

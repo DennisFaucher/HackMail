@@ -7,6 +7,7 @@ struct AccountSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var email = ""
     @State private var fullName = ""
+    @State private var signature = ""
     @State private var appPassword = ""
     @State private var errorMessage: String?
     @State private var savedMessage: String?
@@ -49,7 +50,7 @@ struct AccountSettingsView: View {
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Edit \(account.email)")
-                        .help("Edit full name or app password")
+                        .help("Edit full name, signature, or app password")
                         if store.hasPassword(for: account) {
                             Button {
                                 Task { await store.refreshMailbox(for: account) }
@@ -99,6 +100,28 @@ struct AccountSettingsView: View {
                     TextField("Your name", text: $fullName).textFieldStyle(.roundedBorder).textContentType(.name)
                 }
                 VStack(alignment: .leading, spacing: 6) {
+                    Text("Email signature (optional)").font(.system(size: 11.5, weight: .medium)).foregroundStyle(Paper.secondary)
+                    ZStack(alignment: .topLeading) {
+                        if signature.isEmpty {
+                            Text("Thanks,\nYour name")
+                                .font(.system(size: 12))
+                                .foregroundStyle(Paper.secondary.opacity(0.7))
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 10)
+                                .allowsHitTesting(false)
+                        }
+                        TextEditor(text: $signature)
+                            .font(.system(size: 12))
+                            .scrollContentBackground(.hidden)
+                    }
+                    .frame(height: 88)
+                    .padding(3)
+                    .background(Color.white.opacity(0.7), in: RoundedRectangle(cornerRadius: 7))
+                    .overlay(RoundedRectangle(cornerRadius: 7).stroke(Paper.border, lineWidth: 1))
+                    Text("Inserted into new messages, replies, and forwards. You can edit it in the draft.")
+                        .font(.system(size: 10.5)).foregroundStyle(Paper.secondary)
+                }
+                VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Text("Google app password").font(.system(size: 11.5, weight: .medium)).foregroundStyle(Paper.secondary)
                         Spacer()
@@ -107,7 +130,7 @@ struct AccountSettingsView: View {
                     SecureField(hasSavedPasswordForForm ? "Leave blank to keep the saved password" : "xxxx xxxx xxxx xxxx", text: $appPassword)
                         .textFieldStyle(.roundedBorder)
                     if hasSavedPasswordForForm {
-                        Text("Leave blank to change only the full name.").font(.system(size: 10.5)).foregroundStyle(Paper.secondary)
+                        Text("Leave blank to change the name or signature without changing the password.").font(.system(size: 10.5)).foregroundStyle(Paper.secondary)
                     }
                 }
                 Text("Create an app password in your Google Account after enabling 2-Step Verification. It is stored only in macOS Keychain.")
@@ -297,6 +320,7 @@ struct AccountSettingsView: View {
     private func loadAccount(_ account: MailAccount) {
         email = account.email
         fullName = account.fullName
+        signature = account.signature
         appPassword = ""
         errorMessage = nil
         savedMessage = nil
@@ -315,10 +339,15 @@ struct AccountSettingsView: View {
             return
         }
         do {
-            try store.saveAccount(email: normalizedEmail, fullName: fullName, password: password.isEmpty ? nil : password)
+            try store.saveAccount(
+                email: normalizedEmail,
+                fullName: fullName,
+                signature: signature,
+                password: password.isEmpty ? nil : password
+            )
             appPassword = ""
             errorMessage = nil
-            savedMessage = password.isEmpty ? "Full name saved." : "Account and app password saved securely."
+            savedMessage = password.isEmpty ? "Account settings saved." : "Account and app password saved securely."
         } catch {
             errorMessage = error.localizedDescription
         }
