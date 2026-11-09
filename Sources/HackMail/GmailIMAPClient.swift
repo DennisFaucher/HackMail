@@ -215,6 +215,17 @@ struct GmailIMAPClient {
     }
 }
 
+enum IMAPCommandText {
+    /// Wraps `value` in an IMAP quoted string. Rejects CR, LF, NUL and other control characters, which
+    /// would otherwise end the command early and let a value inject its own IMAP commands.
+    static func quote(_ value: String) throws -> String {
+        guard value.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
+            throw IMAPError.invalidCommandText
+        }
+        return "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    }
+}
+
 struct MailboxSnapshot: Sendable {
     let mailboxes: [MailMailbox]
     let messages: [MailMessage]
@@ -253,6 +264,9 @@ private enum IMAPError: LocalizedError {
     case authentication
     case noInbox
     case invalidSearchQuery
+    case timeout
+    case responseTooLarge
+    case invalidCommandText
 
     var errorDescription: String? {
         switch self {
@@ -260,6 +274,9 @@ private enum IMAPError: LocalizedError {
         case .protocolError(let detail): "Gmail returned an unexpected IMAP response: \(detail)"
         case .authentication: "Gmail rejected the app password. Check the address and app password in Account Settings."
         case .noInbox: "Gmail did not return an Inbox mailbox."
+        case .timeout: "Gmail did not respond in time. Check your connection and try again."
+        case .invalidCommandText: "A value contained line breaks or control characters and was not sent to Gmail."
+        case .responseTooLarge: "Gmail sent a response larger than HackMail accepts, so the request was stopped."
         case .invalidSearchQuery: "Enter a Gmail search query without line breaks or control characters."
         }
     }
@@ -282,7 +299,16 @@ private actor IMAPSession {
         }
     }
 
+    // Network safety limits. A stalled server must not hang a request forever, and a hostile or
+    // buggy server must not be able to grow memory without bound.
+    private static let connectTimeout: Duration = .seconds(20)
+    private static let defaultReceiveTimeout: Duration = .seconds(30)
+    private static let maximumLineBytes = 2 * 1024 * 1024
+    private static let maximumLiteralBytes = 32 * 1024 * 1024
+    private static let maximumResponseBytes = 64 * 1024 * 1024
+
     private let queue = DispatchQueue(label: "HackMail.GmailIMAP")
+    private var receiveTimeout: Duration = IMAPSession.defaultReceiveTimeout
     private var connection: NWConnection?
     private var buffered = Data()
     private var nextTag = 1
@@ -297,31 +323,37 @@ private actor IMAPSession {
         }
         let connection = NWConnection(host: endpoint, port: port, using: .tls)
         self.connection = connection
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    connection.stateUpdateHandler = nil
-                    continuation.resume()
-                case .failed(let error):
-                    connection.stateUpdateHandler = nil
-                    continuation.resume(throwing: IMAPError.connection(error.localizedDescription))
-                case .cancelled:
-                    connection.stateUpdateHandler = nil
-                    continuation.resume(throwing: IMAPError.connection("Connection was cancelled."))
-                default:
-                    break
+        let deadline = ConnectionDeadline(after: Self.connectTimeout, connection: connection)
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                connection.stateUpdateHandler = { state in
+                    switch state {
+                    case .ready:
+                        connection.stateUpdateHandler = nil
+                        continuation.resume()
+                    case .failed(let error):
+                        connection.stateUpdateHandler = nil
+                        continuation.resume(throwing: IMAPError.connection(error.localizedDescription))
+                    case .cancelled:
+                        connection.stateUpdateHandler = nil
+                        continuation.resume(throwing: IMAPError.connection("Connection was cancelled."))
+                    default:
+                        break
+                    }
                 }
+                connection.start(queue: queue)
             }
-            connection.start(queue: queue)
+        } catch {
+            throw deadline.finish() ? IMAPError.timeout : error
         }
+        deadline.finish()
 
         let greeting = try await readLine()
         guard greeting.uppercased().contains("* OK") else {
             throw IMAPError.protocolError(greeting)
         }
         do {
-            _ = try await command("LOGIN \(quote(email)) \(quote(password))")
+            _ = try await command("LOGIN \(try quote(email)) \(try quote(password))")
         } catch IMAPError.protocolError(let detail) where detail.localizedCaseInsensitiveContains("NO") || detail.localizedCaseInsensitiveContains("AUTHENTICATIONFAILED") {
             throw IMAPError.authentication
         }
@@ -338,11 +370,14 @@ private actor IMAPSession {
     }
 
     func fetchMailbox(path: String, limit: Int) async throws -> [MailMessage] {
-        try await selectMailbox(path: path)
-        let uids = try await searchUIDs(after: nil).suffix(max(1, limit))
-        guard !uids.isEmpty else { return [] }
-
-        return try await fetchMessages(uids: Array(uids), mailboxPath: path)
+        // Fetch the newest messages by sequence number. UID SEARCH ALL returns every UID in the
+        // mailbox, which is slow (and a huge single response) for large folders like Archive.
+        let total = try await selectMailboxAndGetMessageCount(path: path)
+        guard total > 0 else { return [] }
+        let first = max(1, total - max(1, limit) + 1)
+        let response = try await command("FETCH \(first):\(total) (UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE)")
+        return response.lines.compactMap { IMAPServerResponseParser.parseMessage($0, mailboxPath: path) }
+            .sorted { $0.id > $1.id }
     }
 
     func searchUIDs(after lastUID: Int?) async throws -> [Int] {
@@ -363,7 +398,7 @@ private actor IMAPSession {
 
     func searchMailbox(path: String, query: String) async throws -> [Int] {
         try await selectMailbox(path: path)
-        let response = try await command("UID SEARCH X-GM-RAW \(quote(query))")
+        let response = try await command("UID SEARCH X-GM-RAW \(try quote(query))")
         return IMAPServerResponseParser.parseSearchUIDs(response.lines).sorted(by: >)
     }
 
@@ -381,7 +416,7 @@ private actor IMAPSession {
     }
 
     func selectMailboxAndGetMessageCount(path: String) async throws -> Int {
-        let selected = try await command("SELECT \(quote(path))")
+        let selected = try await command("SELECT \(try quote(path))")
         guard selected.lines.contains(where: { $0.localizedCaseInsensitiveContains("EXISTS") }) ||
                 selected.lines.contains(where: { $0.localizedCaseInsensitiveContains("READ-WRITE") }) else {
             throw IMAPError.protocolError("Could not select mailbox \(path).")
@@ -399,6 +434,8 @@ private actor IMAPSession {
         nextTag += 1
         activeIdleTag = tag
         didSendIdleDone = false
+        // IDLE is silent until something changes; allow the full keepalive window plus grace.
+        receiveTimeout = timeout + .seconds(90)
         try await send("\(tag) IDLE\r\n")
         let continuation = try await readLine()
         guard continuation.hasPrefix("+") else {
@@ -417,6 +454,7 @@ private actor IMAPSession {
         }
         defer {
             timeoutTask.cancel()
+            receiveTimeout = Self.defaultReceiveTimeout
             activeIdleTag = nil
             didSendIdleDone = false
         }
@@ -580,7 +618,7 @@ private actor IMAPSession {
         guard let uidSet = makeUIDSet(uids) else { return }
         try await loadCapabilities()
         if capabilities.contains("MOVE") {
-            let moveCommand = "UID MOVE \(uidSet) \(quote(destination))"
+            let moveCommand = "UID MOVE \(uidSet) \(try quote(destination))"
             do {
                 _ = try await command(moveCommand)
             } catch IMAPError.protocolError(let detail) where detail.localizedCaseInsensitiveContains("SYSTEM ERROR") {
@@ -590,7 +628,7 @@ private actor IMAPSession {
                 _ = try await command(moveCommand)
             }
         } else if capabilities.contains("UIDPLUS") {
-            _ = try await command("UID COPY \(uidSet) \(quote(destination))")
+            _ = try await command("UID COPY \(uidSet) \(try quote(destination))")
             _ = try await command("UID STORE \(uidSet) +FLAGS.SILENT (\\Deleted)")
             _ = try await command("UID EXPUNGE \(uidSet)")
         } else {
@@ -643,13 +681,20 @@ private actor IMAPSession {
         try await send("\(tag) \(command)\r\n")
 
         var segments: [Segment] = []
+        var responseBytes = 0
         while true {
             let line = try await readLineData()
             segments.append(.line(line))
+            responseBytes += line.count
             let text = String(decoding: line, as: UTF8.self)
             if let literalCount = Self.literalLength(in: text) {
+                responseBytes += max(0, literalCount)
+                guard literalCount <= Self.maximumLiteralBytes, responseBytes <= Self.maximumResponseBytes else {
+                    throw IMAPError.responseTooLarge
+                }
                 segments.append(.literal(try await readExactly(literalCount)))
             }
+            guard responseBytes <= Self.maximumResponseBytes else { throw IMAPError.responseTooLarge }
             if text.hasPrefix("\(tag) ") {
                 let status = text.dropFirst(tag.count + 1).uppercased()
                 if status.hasPrefix("NO") || status.hasPrefix("BAD") {
@@ -683,12 +728,14 @@ private actor IMAPSession {
                 buffered.removeSubrange(buffered.startIndex..<range.upperBound)
                 return line
             }
+            guard buffered.count <= Self.maximumLineBytes else { throw IMAPError.responseTooLarge }
             try await receiveMore()
         }
     }
 
     private func readExactly(_ count: Int) async throws -> Data {
         guard count >= 0 else { throw IMAPError.protocolError("Invalid literal length.") }
+        guard count <= Self.maximumLiteralBytes else { throw IMAPError.responseTooLarge }
         while buffered.count < count { try await receiveMore() }
         let result = buffered.prefix(count)
         buffered.removeFirst(count)
@@ -697,24 +744,31 @@ private actor IMAPSession {
 
     private func receiveMore() async throws {
         guard let connection else { throw IMAPError.connection("Connection closed.") }
-        let chunk: Data = try await withCheckedThrowingContinuation { continuation in
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { content, _, isComplete, error in
-                if let error {
-                    continuation.resume(throwing: IMAPError.connection(error.localizedDescription))
-                } else if let content, !content.isEmpty {
-                    continuation.resume(returning: content)
-                } else if isComplete {
-                    continuation.resume(throwing: IMAPError.connection("Gmail closed the connection."))
-                } else {
-                    continuation.resume(throwing: IMAPError.connection("Gmail returned an empty response."))
+        let deadline = ConnectionDeadline(after: receiveTimeout, connection: connection)
+        let chunk: Data
+        do {
+            chunk = try await withCheckedThrowingContinuation { continuation in
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { content, _, isComplete, error in
+                    if let error {
+                        continuation.resume(throwing: IMAPError.connection(error.localizedDescription))
+                    } else if let content, !content.isEmpty {
+                        continuation.resume(returning: content)
+                    } else if isComplete {
+                        continuation.resume(throwing: IMAPError.connection("Gmail closed the connection."))
+                    } else {
+                        continuation.resume(throwing: IMAPError.connection("Gmail returned an empty response."))
+                    }
                 }
             }
+        } catch {
+            throw deadline.finish() ? IMAPError.timeout : error
         }
+        deadline.finish()
         buffered.append(chunk)
     }
 
-    private func quote(_ value: String) -> String {
-        "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    private func quote(_ value: String) throws -> String {
+        try IMAPCommandText.quote(value)
     }
 
     private static func literalLength(in line: String) -> Int? {

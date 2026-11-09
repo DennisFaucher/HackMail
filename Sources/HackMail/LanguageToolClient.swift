@@ -33,17 +33,29 @@ private enum LanguageToolError: LocalizedError {
     case invalidURL
     case rejected(Int)
     case invalidResponse
+    case responseTooLarge
 
     var errorDescription: String? {
         switch self {
         case .invalidURL: "Enter a valid HTTPS LanguageTool server URL."
         case .rejected(let status): "LanguageTool returned HTTP \(status)."
         case .invalidResponse: "LanguageTool returned an unreadable response."
+        case .responseTooLarge: "LanguageTool returned a response larger than HackMail accepts."
         }
     }
 }
 
+/// Refuses any redirect that is not HTTPS, so draft text can never be re-sent over plain HTTP.
+private final class HTTPSOnlyRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest) async -> URLRequest? {
+        request.url?.scheme?.lowercased() == "https" ? request : nil
+    }
+}
+
 struct LanguageToolClient: Sendable {
+    static let maximumResponseBytes = 2 * 1024 * 1024
+
     func check(text: String, baseURL: String, language: String) async throws -> [LanguageToolMatch] {
         guard let endpoint = Self.checkEndpoint(from: baseURL) else { throw LanguageToolError.invalidURL }
         var request = URLRequest(url: endpoint, timeoutInterval: 15)
@@ -57,9 +69,18 @@ struct LanguageToolClient: Sendable {
         ]
         request.httpBody = bodyComponents.percentEncodedQuery?.data(using: .utf8)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        // Ephemeral session: no cookies, credentials, or disk cache for draft-related traffic.
+        let session = URLSession(configuration: .ephemeral, delegate: HTTPSOnlyRedirectDelegate(), delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+        let (bytes, response) = try await session.bytes(for: request)
         guard let response = response as? HTTPURLResponse else { throw LanguageToolError.invalidResponse }
         guard (200..<300).contains(response.statusCode) else { throw LanguageToolError.rejected(response.statusCode) }
+        guard response.expectedContentLength <= Int64(Self.maximumResponseBytes) else { throw LanguageToolError.responseTooLarge }
+        var data = Data()
+        for try await byte in bytes {
+            data.append(byte)
+            guard data.count <= Self.maximumResponseBytes else { throw LanguageToolError.responseTooLarge }
+        }
         return try JSONDecoder().decode(LanguageToolResponse.self, from: data).matches
     }
 

@@ -159,18 +159,35 @@ enum SMTPMessageBuilder {
         }.joined()
     }
 
-    private static func encodedSubject(_ subject: String) -> String {
-        guard !subject.unicodeScalars.allSatisfy(\.isASCII) else { return subject }
-        return "=?UTF-8?B?\(Data(subject.utf8).base64EncodedString())?="
+    /// RFC 2047 limits each encoded word to 75 characters, so long non-ASCII text is split on character
+    /// boundaries into several base64 words joined by header folding (CRLF + space).
+    static func encodedWords(_ text: String) -> String {
+        let maximumChunkBytes = 45 // 45 raw bytes -> 60 base64 chars; with "=?UTF-8?B?" and "?=" that is 72.
+        var chunks: [String] = []
+        var current = ""
+        for character in text {
+            if current.utf8.count + String(character).utf8.count > maximumChunkBytes, !current.isEmpty {
+                chunks.append(current)
+                current = ""
+            }
+            current.append(character)
+        }
+        if !current.isEmpty { chunks.append(current) }
+        return chunks.map { "=?UTF-8?B?\(Data($0.utf8).base64EncodedString())?=" }.joined(separator: "\r\n ")
     }
 
-    private static func encodedDisplayName(_ name: String) -> String {
+    static func encodedSubject(_ subject: String) -> String {
+        guard !subject.unicodeScalars.allSatisfy(\.isASCII) else { return subject }
+        return encodedWords(subject)
+    }
+
+    static func encodedDisplayName(_ name: String) -> String {
         if name.unicodeScalars.allSatisfy(\.isASCII) {
             let escaped = name.replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "\"", with: "\\\"")
             return "\"\(escaped)\""
         }
-        return "=?UTF-8?B?\(Data(name.utf8).base64EncodedString())?="
+        return encodedWords(name)
     }
 }
 
@@ -181,6 +198,8 @@ private enum SMTPError: LocalizedError {
     case authentication
     case invalidMessage
     case deliveryUncertain
+    case timeout
+    case responseTooLarge
 
     var errorDescription: String? {
         switch self {
@@ -190,6 +209,8 @@ private enum SMTPError: LocalizedError {
         case .authentication: "Gmail rejected the app password for sending. Check the account in Settings."
         case .invalidMessage: "Enter a valid sender, recipient, and single-line subject. Separate recipients with commas."
         case .deliveryUncertain: "The connection ended while Gmail was acknowledging the message. Check Sent before retrying to avoid a duplicate."
+        case .timeout: "Gmail SMTP did not respond in time. Check your connection and try again."
+        case .responseTooLarge: "Gmail SMTP sent a response larger than HackMail accepts, so sending was stopped."
         }
     }
 }
@@ -201,7 +222,15 @@ private actor SMTPSession {
         var summary: String { lines.joined(separator: " ") }
     }
 
+    private static let connectTimeout: Duration = .seconds(20)
+    private static let defaultReceiveTimeout: Duration = .seconds(30)
+    // Gmail confirms a message only after receiving the whole payload, which can be tens of MiB.
+    private static let acceptanceTimeout: Duration = .seconds(180)
+    private static let maximumLineBytes = 64 * 1024
+    private static let maximumReplyLines = 200
+
     private let queue = DispatchQueue(label: "HackMail.GmailSMTP")
+    private var receiveTimeout: Duration = SMTPSession.defaultReceiveTimeout
     private var connection: NWConnection?
     private var buffered = Data()
 
@@ -211,24 +240,30 @@ private actor SMTPSession {
         }
         let connection = NWConnection(host: "smtp.gmail.com", port: port, using: .tls)
         self.connection = connection
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    connection.stateUpdateHandler = nil
-                    continuation.resume()
-                case .failed(let error):
-                    connection.stateUpdateHandler = nil
-                    continuation.resume(throwing: SMTPError.connection(error.localizedDescription))
-                case .cancelled:
-                    connection.stateUpdateHandler = nil
-                    continuation.resume(throwing: SMTPError.connection("Connection was cancelled."))
-                default:
-                    break
+        let deadline = ConnectionDeadline(after: Self.connectTimeout, connection: connection)
+        do {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                connection.stateUpdateHandler = { state in
+                    switch state {
+                    case .ready:
+                        connection.stateUpdateHandler = nil
+                        continuation.resume()
+                    case .failed(let error):
+                        connection.stateUpdateHandler = nil
+                        continuation.resume(throwing: SMTPError.connection(error.localizedDescription))
+                    case .cancelled:
+                        connection.stateUpdateHandler = nil
+                        continuation.resume(throwing: SMTPError.connection("Connection was cancelled."))
+                    default:
+                        break
+                    }
                 }
+                connection.start(queue: queue)
             }
-            connection.start(queue: queue)
+        } catch {
+            throw deadline.finish() ? SMTPError.timeout : error
         }
+        deadline.finish()
         let greeting = try await readReply()
         try require(greeting, codes: [220])
         let hello = try await command("EHLO localhost")
@@ -262,6 +297,8 @@ private actor SMTPSession {
         let payload = SMTPMessageBuilder.build(from: from, fromName: fromName, recipients: recipients, subject: subject, body: body, attachments: attachments)
         do {
             try await send(payload + ".\r\n")
+            receiveTimeout = Self.acceptanceTimeout
+            defer { receiveTimeout = Self.defaultReceiveTimeout }
             let accepted = try await readReply()
             try require(accepted, codes: [250])
         } catch SMTPError.server(let code, let detail) {
@@ -300,6 +337,7 @@ private actor SMTPSession {
             }
             responseCode = code
             lines.append(line.count > 4 ? String(line.dropFirst(4)) : "")
+            guard lines.count <= Self.maximumReplyLines else { throw SMTPError.responseTooLarge }
             guard line.count < 4 || line[line.index(line.startIndex, offsetBy: 3)] != "-" else { continue }
             return Reply(code: code, lines: lines)
         }
@@ -332,25 +370,33 @@ private actor SMTPSession {
                 buffered.removeSubrange(buffered.startIndex..<range.upperBound)
                 return String(decoding: lineData, as: UTF8.self)
             }
+            guard buffered.count <= Self.maximumLineBytes else { throw SMTPError.responseTooLarge }
             try await receiveMore()
         }
     }
 
     private func receiveMore() async throws {
         guard let connection else { throw SMTPError.connection("Connection closed.") }
-        let data: Data = try await withCheckedThrowingContinuation { continuation in
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { content, _, isComplete, error in
-                if let error {
-                    continuation.resume(throwing: SMTPError.connection(error.localizedDescription))
-                } else if let content, !content.isEmpty {
-                    continuation.resume(returning: content)
-                } else if isComplete {
-                    continuation.resume(throwing: SMTPError.connection("Gmail closed the connection."))
-                } else {
-                    continuation.resume(throwing: SMTPError.connection("Gmail returned an empty response."))
+        let deadline = ConnectionDeadline(after: receiveTimeout, connection: connection)
+        let data: Data
+        do {
+            data = try await withCheckedThrowingContinuation { continuation in
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { content, _, isComplete, error in
+                    if let error {
+                        continuation.resume(throwing: SMTPError.connection(error.localizedDescription))
+                    } else if let content, !content.isEmpty {
+                        continuation.resume(returning: content)
+                    } else if isComplete {
+                        continuation.resume(throwing: SMTPError.connection("Gmail closed the connection."))
+                    } else {
+                        continuation.resume(throwing: SMTPError.connection("Gmail returned an empty response."))
+                    }
                 }
             }
+        } catch {
+            throw deadline.finish() ? SMTPError.timeout : error
         }
+        deadline.finish()
         buffered.append(data)
     }
 

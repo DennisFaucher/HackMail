@@ -503,4 +503,28 @@ final class MailStoreNavigationTests: XCTestCase {
         store.select(remote)
         XCTAssertTrue(store.messages[1].unread)
     }
+
+    func testIMAPQuoteEscapesAndRejectsControlCharacters() throws {
+        XCTAssertEqual(try IMAPCommandText.quote("plain"), "\"plain\"")
+        XCTAssertEqual(try IMAPCommandText.quote(#"a"b\c"#), #""a\"b\\c""#)
+        for hostile in ["INBOX\r\nA1 DELETE x", "a\nb", "a\rb", "a\u{0}b", "a\tb"] {
+            XCTAssertThrowsError(try IMAPCommandText.quote(hostile), hostile)
+        }
+    }
+
+    func testLongNonASCIISubjectIsSplitIntoShortEncodedWords() throws {
+        let subject = String(repeating: "Grüße 日本語 😀 ", count: 12)
+        let encoded = SMTPMessageBuilder.encodedSubject(subject)
+        let words = encoded.components(separatedBy: "\r\n ")
+        XCTAssertGreaterThan(words.count, 1)
+        var decoded = ""
+        for word in words {
+            XCTAssertLessThanOrEqual(word.count, 75, word)
+            XCTAssertTrue(word.hasPrefix("=?UTF-8?B?") && word.hasSuffix("?="))
+            let base64 = String(word.dropFirst(10).dropLast(2))
+            decoded += String(decoding: try XCTUnwrap(Data(base64Encoded: base64)), as: UTF8.self)
+        }
+        XCTAssertEqual(decoded, subject)
+        XCTAssertEqual(SMTPMessageBuilder.encodedSubject("Plain subject"), "Plain subject")
+    }
 }

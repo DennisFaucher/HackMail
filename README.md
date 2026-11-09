@@ -12,6 +12,7 @@ swift run
 
 Run the automated checks with `swift test`.
 
+No message is selected when you open a folder or finish a search; nothing loads until you click a message.
 In the message list, click a row or mailbox to focus the list, then use **↑ / ↓** to move through
 messages and update the reader. **Command-click** adds or removes messages from a selection;
 **Shift-click** selects a range. Bulk toolbar actions move, archive, flag/unflag, or delete selected messages.
@@ -51,9 +52,12 @@ attachment download feature.
 * Reply/forward preparation fetches incomplete source bodies in the background, preserves the sanitized HTML original in a formatted quote, and supplies a bounded plain-text alternative to keep large-message preparation responsive.
 * Bundled CID images are sent as inline related MIME parts; remote images remain subject to the reader's opt-in.
 * Recipient autocomplete can search a user-selected macOS Contacts list after explicit Contacts permission; contact details are held in memory for the active compose session and are not saved by HackMail.
-* Automated tests cover SMTP formatting and attachments; real-server and cross-client behavior should be verified with your own accounts before relying on it.
+* Network operations time out (20 s to connect, 30 s without data) and server responses are size-capped, so a stalled or oversized response ends the request with an error instead of hanging.
+* Email HTML is parsed and sanitized into a safe subset (no scripts, forms, embedded objects, unsafe links, or remote loads unless you opt in). Messages over 8 MiB, or HTML that cannot be parsed, display as plain text. The parser repairs malformed markup, so a few messages may lay out slightly differently than in other clients.
+* Compose has a To field only (no Cc or Bcc), and recipient addresses must have ASCII domains.
+* Automated tests cover SMTP formatting and attachments, IMAP command quoting, and the HTML sanitizer; real-server and cross-client behavior should be verified with your own accounts before relying on it.
 
 * LanguageTool spell/grammar checks are optional and off by default. When enabled, checks run against
-the configured HTTPS server after a brief pause in typing. Only the editable message body is sent; quoted originals, recipients, and attachments are excluded. Issues appear with temporary red dotted underlines; suggestions are reviewed and applied explicitly from the review panel or by right-clicking an underlined issue, and are not saved by HackMail.
+the configured HTTPS server (redirects to non-HTTPS are refused; nothing is cached or stored) after a brief pause in typing. Only the editable message body is sent; quoted originals, recipients, and attachments are excluded. Issues appear with temporary red dotted underlines; suggestions are reviewed and applied explicitly from the review panel or by right-clicking an underlined issue, and are not saved by HackMail.
 * The native compose editor enables macOS spelling and grammar checks while leaving automatic spelling
 correction off.

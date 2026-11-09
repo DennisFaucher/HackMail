@@ -128,7 +128,8 @@ final class MailStore: ObservableObject {
     }
 
     var selectedMessage: MailMessage? {
-        filteredMessages.first(where: { $0.id == selectedMessageID }) ?? filteredMessages.first
+        // No implicit selection: nothing is selected (and no body is fetched) until the user picks a message.
+        filteredMessages.first(where: { $0.id == selectedMessageID })
     }
 
     var selectedMessages: [MailMessage] {
@@ -609,8 +610,8 @@ final class MailStore: ObservableObject {
             let previousSelection = selectedMessageID
             mailboxes = snapshot.mailboxes
             messages = snapshot.messages
-            selectedMessageID = snapshot.messages.first(where: { $0.id == previousSelection })?.id
-                ?? snapshot.messages.first?.id ?? -1
+            // Keep the user's selection across a refresh if that message is still listed; never pick one for them.
+            selectedMessageID = snapshot.messages.first(where: { $0.id == previousSelection })?.id ?? -1
             selectedAccount = account.email
             accountStatuses[account.email] = "Connected · \(selectedMailbox?.name ?? "mailbox") loaded"
             if let selected = snapshot.messages.first(where: { $0.id == selectedMessageID }) {
@@ -736,10 +737,7 @@ final class MailStore: ObservableObject {
             searchResultUIDs = snapshot.matchingUIDs
             searchNextUIDOffset = min(snapshot.matchingUIDs.count, 30)
             messages = snapshot.messages
-            selectedMessageID = messages.first?.id ?? -1
-            if let selected = messages.first {
-                await loadBody(for: selected, accountEmail: account.email)
-            }
+            selectedMessageID = -1
         } catch {
             guard searchRequestID == requestID else { return }
             searchError = error.localizedDescription
@@ -1253,10 +1251,7 @@ final class MailStore: ObservableObject {
         multiSelectedMessageIDs.subtract(messageIDs)
         if multiSelectedMessageIDs.isEmpty { isMultiSelectionActive = false }
         guard selectedMessageWasRemoved else { return }
-        selectedMessageID = filteredMessages.first?.id ?? -1
-        if let nextMessage = selectedMessage, nextMessage.body.isEmpty {
-            Task { await loadBody(for: nextMessage, accountEmail: account.email) }
-        }
+        selectedMessageID = -1
     }
 
     private func persistAccounts() {
