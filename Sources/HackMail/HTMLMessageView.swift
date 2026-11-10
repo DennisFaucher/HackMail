@@ -16,6 +16,7 @@ struct HTMLMessageView: NSViewRepresentable {
         webView.navigationDelegate = context.coordinator
         webView.underPageBackgroundColor = .clear
         webView.allowsBackForwardNavigationGestures = false
+        context.coordinator.installScrollWheelMonitor(for: webView)
         context.coordinator.load(html, allowRemoteImages: allowRemoteImages, into: webView)
         return webView
     }
@@ -25,12 +26,35 @@ struct HTMLMessageView: NSViewRepresentable {
         context.coordinator.load(html, allowRemoteImages: allowRemoteImages, into: webView)
     }
 
+    static func dismantleNSView(_ webView: WKWebView, coordinator: Coordinator) {
+        coordinator.removeScrollWheelMonitor()
+    }
+
     final class Coordinator: NSObject, WKNavigationDelegate {
         var onOpenLink: (URL) -> Void
         private var lastDocument: String?
+        private var scrollWheelMonitor: Any?
 
         init(onOpenLink: @escaping (URL) -> Void) {
             self.onOpenLink = onOpenLink
+        }
+
+        func installScrollWheelMonitor(for webView: WKWebView) {
+            removeScrollWheelMonitor()
+            scrollWheelMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak webView] event in
+                guard let webView,
+                      webView.window === event.window,
+                      webView.bounds.contains(webView.convert(event.locationInWindow, from: nil)) else { return event }
+                webView.scrollWheel(with: event)
+                return nil
+            }
+        }
+
+        func removeScrollWheelMonitor() {
+            if let scrollWheelMonitor {
+                NSEvent.removeMonitor(scrollWheelMonitor)
+                self.scrollWheelMonitor = nil
+            }
         }
 
         func load(_ source: String, allowRemoteImages: Bool, into webView: WKWebView) {

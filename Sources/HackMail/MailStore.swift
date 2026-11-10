@@ -8,6 +8,12 @@ final class MailStore: ObservableObject {
     @Published var mailboxes: [MailMailbox] = []
     @Published var selectedMailboxPath = "INBOX"
     @Published var selectedMessageID = -1
+    /// The current serial stage of a mailbox load, shown while the list is loading.
+    @Published var mailboxLoadProgress: MailboxLoadProgress?
+    @Published var isPreparingPrint = false
+    /// When the current mailbox load or search began, for an elapsed-time readout.
+    @Published var loadStartedAt: Date?
+    private var searchTask: Task<Void, Never>?
     @Published private(set) var multiSelectedMessageIDs: Set<Int> = []
     @Published private(set) var isMultiSelectionActive = false
     @Published private(set) var sortColumn: MessageSortColumn = .date
@@ -20,7 +26,7 @@ final class MailStore: ObservableObject {
     @Published var showSettings = false
     @Published var selectedContactsContainerIdentifier: String?
     @Published var languageToolEnabled = false
-    @Published var languageToolBaseURL = ""
+    @Published var languageToolBaseURL = PersonalDefaults.languageToolBaseURL
     @Published var languageToolLanguage = "en-US"
     @Published var inboxNotificationsEnabled = true
     @Published private(set) var inboxNotificationsAuthorized = false
@@ -28,6 +34,9 @@ final class MailStore: ObservableObject {
     @Published var isComposing = false
     @Published var composeTitle = "New Message"
     @Published var composeTo = ""
+    @Published var composeCc = ""
+    @Published var composeBcc = ""
+    @Published var composeShowsCcBcc = false
     @Published var composeSubject = ""
     @Published var composeBody = NSAttributedString(string: "")
     @Published var composeBodyWasTruncated = false
@@ -46,6 +55,7 @@ final class MailStore: ObservableObject {
     @Published var pendingPermanentDelete: MailMessage?
     @Published var pendingMultiPermanentDelete: [MailMessage]?
     @Published private(set) var loadingMessageID: Int?
+    @Published private(set) var activeAttachmentActionID: String?
 
     private let accountsKey = "configured-mail-accounts"
     private let contactsContainerKey = "contacts-container-identifier"
@@ -65,7 +75,7 @@ final class MailStore: ObservableObject {
     private var inboxMonitorIDs: [String: UUID] = [:]
     private var markingReadMessageKeys: Set<String> = []
 
-    static let defaultLanguageToolBaseURL = ""
+    static let defaultLanguageToolBaseURL = PersonalDefaults.languageToolBaseURL
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -75,10 +85,10 @@ final class MailStore: ObservableObject {
         languageToolLanguage = defaults.string(forKey: languageToolLanguageKey) ?? "en-US"
         inboxNotificationsEnabled = defaults.object(forKey: inboxNotificationsEnabledKey) as? Bool ?? true
         if let data = defaults.data(forKey: accountsKey),
-           let saved = try? JSONDecoder().decode([MailAccount].self, from: data) {
+           let saved = try? JSONDecoder().decode([MailAccount].self, from: data), !saved.isEmpty {
             accounts = saved
         } else {
-            accounts = []
+            accounts = PersonalDefaults.suggestedAddresses.map { MailAccount(email: $0) }
             persistAccounts()
         }
         selectedAccount = accounts.first?.email
@@ -169,9 +179,30 @@ final class MailStore: ObservableObject {
         }
     }
 
+    /// The parsed To, Cc, and Bcc lists, or nil if any non-empty field contains an invalid address.
+    var composeRecipients: (to: [String], cc: [String], bcc: [String])? {
+        guard let to = GmailSMTPClient.parseOptionalRecipients(composeTo),
+              let cc = GmailSMTPClient.parseOptionalRecipients(composeCc),
+              let bcc = GmailSMTPClient.parseOptionalRecipients(composeBcc) else { return nil }
+        return (to, cc, bcc)
+    }
+
+    /// Distinct addresses across To, Cc, and Bcc.
+    var composeRecipientCount: Int {
+        guard let lists = composeRecipients else { return 0 }
+        return SMTPMessageBuilder.envelopeRecipients(to: lists.to, cc: lists.cc, bcc: lists.bcc).count
+    }
+
+    func clearComposeRecipients() {
+        composeTo = ""
+        composeCc = ""
+        composeBcc = ""
+        composeShowsCcBcc = false
+    }
+
     var canSendComposedMessage: Bool {
         guard let account = accounts.first(where: { $0.email == selectedAccount }) else { return false }
-        return GmailSMTPClient.parseRecipients(composeTo) != nil &&
+        return composeRecipientCount >= 1 && composeRecipientCount <= GmailSMTPClient.maximumRecipients &&
             !composeSubject.contains("\r") && !composeSubject.contains("\n") &&
             !isSendingMessage && !isPreparingCompose && hasPassword(for: account)
     }
@@ -179,7 +210,7 @@ final class MailStore: ObservableObject {
     func beginNewMessage() {
         cancelQuotePreparation()
         composeTitle = "New Message"
-        composeTo = ""
+        clearComposeRecipients()
         composeSubject = ""
         let signature = accounts.first(where: { $0.email == selectedAccount })?.signature ?? ""
         composeBody = MailSignatureFormatter.draftBody(for: signature)
@@ -194,6 +225,7 @@ final class MailStore: ObservableObject {
     func beginReply() {
         guard let message = selectedMessage, !message.senderEmail.isEmpty else { return }
         composeTitle = "Reply"
+        clearComposeRecipients()
         composeTo = message.senderEmail
         composeSubject = message.subject.lowercased().hasPrefix("re:") ? message.subject : "Re: \(message.subject)"
         composeAttachments = []
@@ -205,7 +237,7 @@ final class MailStore: ObservableObject {
     func beginForward() {
         guard let message = selectedMessage else { return }
         composeTitle = "Forward"
-        composeTo = ""
+        clearComposeRecipients()
         composeSubject = message.subject.lowercased().hasPrefix("fwd:") ? message.subject : "Fwd: \(message.subject)"
         composeAttachments = []
         quotedMessage = nil
@@ -220,7 +252,8 @@ final class MailStore: ObservableObject {
         guard let password = try? KeychainStore.loadPassword(for: account.email) else {
             throw MailComposerError.missingPassword
         }
-        guard let recipients = GmailSMTPClient.parseRecipients(composeTo) else {
+        guard let lists = composeRecipients,
+              !SMTPMessageBuilder.envelopeRecipients(to: lists.to, cc: lists.cc, bcc: lists.bcc).isEmpty else {
             throw MailComposerError.invalidRecipients
         }
         guard !composeSubject.contains("\r"), !composeSubject.contains("\n") else {
@@ -228,17 +261,9 @@ final class MailStore: ObservableObject {
         }
         isSendingMessage = true
         defer { isSendingMessage = false }
-        var plainText = composeBody.string
-        let htmlData = try? composeBody.data(
-            from: NSRange(location: 0, length: composeBody.length),
-            documentAttributes: [
-                .documentType: NSAttributedString.DocumentType.html,
-                .characterEncoding: String.Encoding.utf8.rawValue
-            ]
-        )
-        var html = htmlData.flatMap { String(data: $0, encoding: .utf8) }
-            .map(EmailHTMLSanitizer.bodyFragment)
-            ?? "<pre>\(EmailHTMLSanitizer.escapeText(plainText))</pre>"
+        let outgoingBody = try ComposeInlineImageProcessor.process(composeBody)
+        var plainText = outgoingBody.plainText
+        var html = outgoingBody.html
         if let quotedMessage {
             let isReply = composeTitle == "Reply"
             let headerText: String
@@ -263,12 +288,14 @@ final class MailStore: ObservableObject {
             from: account.email,
             fromName: account.fullName,
             password: password,
-            to: recipients,
+            to: lists.to,
+            cc: lists.cc,
+            bcc: lists.bcc,
             subject: composeSubject,
             body: OutgoingEmailBody(plainText: plainText, html: htmlDocument),
             attachments: composeAttachments
         )
-        composeTo = ""
+        clearComposeRecipients()
         composeSubject = ""
         composeAttachments = []
         composeBody = NSAttributedString(string: "")
@@ -294,7 +321,7 @@ final class MailStore: ObservableObject {
     func discardComposition() {
         cancelQuotePreparation()
         composeTitle = "New Message"
-        composeTo = ""
+        clearComposeRecipients()
         composeSubject = ""
         composeBody = NSAttributedString(string: "")
         composeBodyWasTruncated = false
@@ -603,10 +630,27 @@ final class MailStore: ObservableObject {
         accountStatuses[account.email] = "Connecting to Gmail…"
         accountErrors[account.email] = nil
         activeError = nil
-        defer { syncingAccount = nil }
+        mailboxLoadProgress = nil
+        loadStartedAt = Date()
+        defer {
+            syncingAccount = nil
+            mailboxLoadProgress = nil
+            loadStartedAt = nil
+        }
         do {
             let client = GmailIMAPClient()
-            let snapshot = try await client.fetchMailbox(email: account.email, password: password, path: requestedPath)
+            let snapshot = try await client.fetchMailbox(
+                email: account.email,
+                password: password,
+                path: requestedPath,
+                progress: { [weak self] step in
+                    Task { @MainActor in
+                        // Ignore a late report that arrives after the load has finished.
+                        guard let self, self.syncingAccount != nil else { return }
+                        self.mailboxLoadProgress = step
+                    }
+                }
+            )
             let previousSelection = selectedMessageID
             mailboxes = snapshot.mailboxes
             messages = snapshot.messages
@@ -652,7 +696,22 @@ final class MailStore: ObservableObject {
             clearSearchAndReload()
             return
         }
-        await performFolderSearch(query)
+        // Run the search as a stored task so the user can cancel it.
+        let task = Task { await performFolderSearch(query) }
+        searchTask = task
+        await task.value
+        if searchTask == task { searchTask = nil }
+    }
+
+    /// Cancels a running folder search, closes its IMAP connection, and returns to the normal folder view.
+    func cancelSearch() {
+        guard activeSearchQuery != nil, syncingAccount != nil else { return }
+        searchTask?.cancel()
+        searchTask = nil
+        syncingAccount = nil
+        mailboxLoadProgress = nil
+        loadStartedAt = nil
+        clearSearchAndReload()
     }
 
     func clearSearchAndReload() {
@@ -720,8 +779,14 @@ final class MailStore: ObservableObject {
         messages = []
         selectedMessageID = -1
         syncingAccount = account.email
+        mailboxLoadProgress = nil
+        loadStartedAt = Date()
         defer {
-            if searchRequestID == requestID { syncingAccount = nil }
+            if searchRequestID == requestID {
+                syncingAccount = nil
+                mailboxLoadProgress = nil
+                loadStartedAt = nil
+            }
         }
 
         do {
@@ -729,7 +794,14 @@ final class MailStore: ObservableObject {
                 email: account.email,
                 password: password,
                 path: mailboxPath,
-                query: query
+                query: query,
+                progress: { [weak self] step in
+                    Task { @MainActor in
+                        // Ignore a late report from a search that was cancelled or already finished.
+                        guard let self, self.searchRequestID == requestID, self.syncingAccount != nil else { return }
+                        self.mailboxLoadProgress = step
+                    }
+                }
             )
             guard searchRequestID == requestID,
                   selectedAccount == account.email,
@@ -794,6 +866,7 @@ final class MailStore: ObservableObject {
                 updated.bodyIsPartial = fetchedBody.isPartial
                 updated.bodyIsLoading = false
                 updated.allowsRemoteImages = false
+                updated.attachments = fetchedBody.attachments
                 return updated
             }
         } catch {
@@ -828,6 +901,51 @@ final class MailStore: ObservableObject {
             updated.bodyIsLoading = false
             return updated
         }
+    }
+
+    var canPrintSelectedMessage: Bool {
+        guard !isMultiSelectionActive, !isPreparingPrint, let message = selectedMessage else { return false }
+        return !message.bodyIsLoading && (message.isRemote || !message.body.isEmpty)
+    }
+
+    /// Prints the selected message. A partially loaded body is fetched in full first, without turning on
+    /// remote images or changing what the reader shows.
+    func printSelectedMessage() {
+        guard canPrintSelectedMessage, let message = selectedMessage else { return }
+        let accountEmail = selectedAccount
+        let mailboxName = selectedMailbox?.name
+        Task { await printMessage(message, accountEmail: accountEmail, mailboxName: mailboxName) }
+    }
+
+    private func printMessage(_ message: MailMessage, accountEmail: String?, mailboxName: String?) async {
+        isPreparingPrint = true
+        defer { isPreparingPrint = false }
+        var printable = message
+        if message.isRemote, message.bodyIsPartial || message.body.isEmpty {
+            guard let account = accounts.first(where: { $0.email == accountEmail }),
+                  let password = try? KeychainStore.loadPassword(for: account.email) else {
+                activeError = "Could not load the complete message to print. Check the Gmail account and try again."
+                return
+            }
+            do {
+                let body = try await GmailIMAPClient().fetchBody(
+                    uid: message.id,
+                    mailboxPath: message.mailboxPath,
+                    email: account.email,
+                    password: password,
+                    full: true,
+                    preferHTML: true
+                )
+                printable.body = body.content
+                printable.bodyIsHTML = body.isHTML
+                printable.bodyIsPartial = false
+                printable.attachments = body.attachments
+            } catch {
+                activeError = "Could not load the complete message to print: \(error.localizedDescription)"
+                return
+            }
+        }
+        MessagePrinter.shared.print(printable, mailboxName: mailboxName)
     }
 
     func loadFullMessage(_ message: MailMessage, accountEmail: String?) async {
@@ -875,6 +993,7 @@ final class MailStore: ObservableObject {
                 updated.bodyIsPartial = false
                 updated.bodyIsLoading = false
                 updated.allowsRemoteImages = fetchedBody.isHTML
+                updated.attachments = fetchedBody.attachments
                 return updated
             }
         } catch {
@@ -907,6 +1026,111 @@ final class MailStore: ObservableObject {
 
     func blockRemoteImages(for message: MailMessage) {
         setRemoteImagesAllowed(false, for: message.id)
+    }
+
+    func attachmentSaveKey(_ attachment: MailAttachmentInfo, message: MailMessage) -> String {
+        "\(message.mailboxPath)|\(message.id)|\(attachment.section)"
+    }
+
+    func saveAttachment(_ attachment: MailAttachmentInfo, from message: MailMessage) {
+        guard let (account, password) = attachmentCredentials(attachment, from: message) else { return }
+
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = Self.safeAttachmentFileName(attachment.fileName)
+        panel.canCreateDirectories = true
+        panel.begin { [weak self] response in
+            guard response == .OK, let destination = panel.url else { return }
+            Task { @MainActor [weak self] in
+                await self?.downloadAndSaveAttachment(
+                    attachment,
+                    from: message,
+                    account: account,
+                    password: password,
+                    to: destination
+                )
+            }
+        }
+    }
+
+    func openAttachment(_ attachment: MailAttachmentInfo, from message: MailMessage) {
+        guard let (account, password) = attachmentCredentials(attachment, from: message) else { return }
+        Task {
+            await downloadAndOpenAttachment(attachment, from: message, account: account, password: password)
+        }
+    }
+
+    private func attachmentCredentials(
+        _ attachment: MailAttachmentInfo,
+        from message: MailMessage
+    ) -> (MailAccount, String)? {
+        guard message.isRemote,
+              message.attachments.contains(where: { $0.id == attachment.id }),
+              let account = accounts.first(where: { $0.email == selectedAccount }),
+              let password = try? KeychainStore.loadPassword(for: account.email) else { return nil }
+        return (account, password)
+    }
+
+    private func downloadAndSaveAttachment(
+        _ attachment: MailAttachmentInfo,
+        from message: MailMessage,
+        account: MailAccount,
+        password: String,
+        to destination: URL
+    ) async {
+        let key = attachmentSaveKey(attachment, message: message)
+        guard activeAttachmentActionID == nil else { return }
+        activeAttachmentActionID = key
+        defer { activeAttachmentActionID = nil }
+
+        do {
+            let data = try await GmailIMAPClient().fetchAttachment(
+                uid: message.id,
+                mailboxPath: message.mailboxPath,
+                attachment: attachment,
+                email: account.email,
+                password: password
+            )
+            try data.write(to: destination, options: .atomic)
+        } catch {
+            activeError = "Could not save \(attachment.fileName): \(error.localizedDescription)"
+        }
+    }
+
+    private func downloadAndOpenAttachment(
+        _ attachment: MailAttachmentInfo,
+        from message: MailMessage,
+        account: MailAccount,
+        password: String
+    ) async {
+        let key = attachmentSaveKey(attachment, message: message)
+        guard activeAttachmentActionID == nil else { return }
+        activeAttachmentActionID = key
+        defer { activeAttachmentActionID = nil }
+
+        do {
+            let data = try await GmailIMAPClient().fetchAttachment(
+                uid: message.id,
+                mailboxPath: message.mailboxPath,
+                attachment: attachment,
+                email: account.email,
+                password: password
+            )
+            let url = try OpenedAttachmentFiles.write(data, fileName: Self.safeAttachmentFileName(attachment.fileName))
+            guard NSWorkspace.shared.open(url) else {
+                try? FileManager.default.removeItem(at: url)
+                throw MailAttachmentOpenError.noHandler
+            }
+        } catch {
+            activeError = "Could not open \(attachment.fileName): \(error.localizedDescription)"
+        }
+    }
+
+    private static func safeAttachmentFileName(_ value: String) -> String {
+        let baseName = URL(fileURLWithPath: value).lastPathComponent
+        let sanitized = baseName.unicodeScalars.map { scalar in
+            CharacterSet.controlCharacters.contains(scalar) || scalar == "/" || scalar == "\\" ? "_" : String(scalar)
+        }.joined()
+        return sanitized.isEmpty || sanitized == "." || sanitized == ".." ? "attachment.bin" : sanitized
     }
 
     func select(_ message: MailMessage) {
@@ -1260,6 +1484,14 @@ final class MailStore: ObservableObject {
     }
 }
 
+private enum MailAttachmentOpenError: LocalizedError {
+    case noHandler
+
+    var errorDescription: String? {
+        "macOS could not find an app to open this attachment. Use Save to choose a location instead."
+    }
+}
+
 private enum MailComposerError: LocalizedError {
     case noAccount
     case missingPassword
@@ -1270,7 +1502,7 @@ private enum MailComposerError: LocalizedError {
         switch self {
         case .noAccount: "Select a Gmail account before sending."
         case .missingPassword: "Add this account's Google app password in Settings before sending."
-        case .invalidRecipients: "Enter one or more valid email addresses, separated by commas."
+        case .invalidRecipients: "Enter at least one valid email address in To, Cc, or Bcc, separated by commas."
         case .invalidSubject: "The subject cannot contain line breaks."
         }
     }

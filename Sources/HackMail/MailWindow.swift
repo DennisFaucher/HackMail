@@ -18,6 +18,7 @@ enum Paper {
 
 private let mailTableColumns: [GridItem] = [
     GridItem(.fixed(72), alignment: .center),
+    GridItem(.fixed(28), alignment: .center),
     GridItem(.flexible(minimum: 180, maximum: 400), alignment: .leading),
     GridItem(.flexible(minimum: 140), alignment: .leading),
     GridItem(.fixed(84), alignment: .trailing)
@@ -93,8 +94,22 @@ struct MailWindow: View {
         return ScrollView {
             if visibleMessages.isEmpty {
                 if store.syncingAccount != nil {
-                    ProgressView(store.activeSearchQuery == nil ? "Loading mailbox…" : "Searching this folder…")
-                        .frame(maxWidth: .infinity, minHeight: 250)
+                    VStack(spacing: 10) {
+                        ProgressView(store.mailboxLoadProgress?.displayText
+                            ?? (store.activeSearchQuery == nil ? "Loading mailbox…" : "Searching this folder…"))
+                        if let started = store.loadStartedAt {
+                            TimelineView(.periodic(from: started, by: 1)) { context in
+                                Text("\(max(0, Int(context.date.timeIntervalSince(started)))) s elapsed")
+                                    .font(.system(size: 11)).foregroundStyle(Paper.secondary).monospacedDigit()
+                            }
+                        }
+                        if store.activeSearchQuery != nil {
+                            Button("Cancel Search (Esc)") { store.cancelSearch() }
+                                .buttonStyle(.bordered).controlSize(.small)
+                                .keyboardShortcut(.cancelAction)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 250)
                 } else if let searchError = store.searchError {
                     ContentUnavailableView(
                         "Search Failed",
@@ -117,6 +132,12 @@ struct MailWindow: View {
                 VStack(spacing: 0) {
                     LazyVGrid(columns: mailTableColumns, alignment: .leading, spacing: 0) {
                         tableHeading(.flagged, alignment: .center)
+                        Image(systemName: "paperclip")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(Paper.secondary)
+                            .frame(maxWidth: .infinity)
+                            .accessibilityLabel("Attachment")
+                            .help("Attachment")
                         tableHeading(.subject, alignment: .leading)
                         tableHeading(.sender, alignment: .leading)
                         tableHeading(.date, alignment: .trailing)
@@ -248,7 +269,7 @@ private struct MailSidebar: View {
                             HStack(alignment: .top, spacing: 9) {
                                 ProgressView().controlSize(.small)
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text("Connecting to Gmail…")
+                                    Text(store.mailboxLoadProgress?.displayText ?? "Connecting to Gmail…")
                                         .font(.system(size: 11.5, weight: .medium)).foregroundStyle(Paper.ink)
                                     Text("Loading folders and recent messages. This can take around 10 seconds.")
                                         .font(.system(size: 10.5)).foregroundStyle(Paper.secondary)
@@ -396,8 +417,6 @@ private struct MailToolbar: View {
                         .font(.system(size: 11, weight: .medium)).foregroundStyle(Paper.secondary)
                         .lineLimit(1).fixedSize()
                     moveMailboxButton
-                    toolbarButton("archivebox", help: "Archive Selected Messages") { store.archiveSelectedMessages() }
-                        .disabled(!canApplyBulkAction)
                     toolbarButton(
                         store.selectedMessagesAreAllFlagged ? "flag.fill" : "flag",
                         help: store.selectedMessagesAreAllFlagged ? "Unflag Selected Messages" : "Flag Selected Messages"
@@ -410,8 +429,6 @@ private struct MailToolbar: View {
                     toolbarButton("xmark", help: "Clear Multi-Selection") { store.clearMultiSelection() }
                 }
             } else {
-                toolbarButton("archivebox", help: "Archive") { store.archiveSelected() }
-                    .disabled(store.selectedMessage?.isRemote != true || store.syncingAccount != nil)
                 moveMailboxButton
                 toolbarButton("trash", help: store.selectedMailbox?.isTrash == true ? "Delete Permanently" : "Move to Trash") { store.deleteSelected() }
                     .disabled(store.selectedMessage?.isRemote != true || store.syncingAccount != nil)
@@ -420,6 +437,8 @@ private struct MailToolbar: View {
                     .disabled(store.selectedMessage == nil || store.selectedMessage?.senderEmail.isEmpty != false || store.selectedMessage?.bodyIsLoading == true || store.syncingAccount != nil || store.isSendingMessage || store.isPreparingCompose)
                 toolbarButton("arrowshape.turn.up.right", help: "Forward") { store.beginForward() }
                     .disabled(store.selectedMessage == nil || store.selectedMessage?.bodyIsLoading == true || store.syncingAccount != nil || store.isSendingMessage || store.isPreparingCompose)
+                toolbarButton("printer", help: "Print Message") { store.printSelectedMessage() }
+                    .disabled(!store.canPrintSelectedMessage || store.syncingAccount != nil)
                 toolbarButton("flag", help: "Flag") {
                     if let message = store.selectedMessage { store.toggleFlag(message) }
                 }.disabled(store.syncingAccount != nil)
@@ -512,6 +531,19 @@ private struct MessageRow: View {
             .accessibilityLabel(message.flagged ? "Remove star from \(message.subject)" : "Star \(message.subject)")
             .help(message.flagged ? "Remove star" : "Star message")
 
+            Group {
+                if message.hasAttachments {
+                    Image(systemName: "paperclip")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Paper.secondary)
+                        .accessibilityLabel("Has attachment")
+                        .help("Has attachment")
+                } else {
+                    Color.clear
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: 34)
+
             Button { onSelect(NSEvent.modifierFlags) } label: {
                 HStack(spacing: 6) {
                     if message.unread { Circle().fill(Paper.accent).frame(width: 5, height: 5) }
@@ -537,6 +569,32 @@ private struct MessageRow: View {
     }
 }
 
+/// One "To:" or "Cc:" row in the reader. Long lists show the first few addresses with a toggle for the rest.
+private struct RecipientLine: View {
+    let label: String
+    let addresses: [MailAddress]
+    @State private var expanded = false
+    private let collapsedCount = 3
+
+    var body: some View {
+        if !addresses.isEmpty {
+            let hidden = max(0, addresses.count - collapsedCount)
+            let shown = expanded ? addresses : Array(addresses.prefix(collapsedCount))
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("\(label):").font(.system(size: 11.5, weight: .semibold)).foregroundStyle(Paper.secondary)
+                Text(shown.map(\.display).joined(separator: ", "))
+                    .font(.system(size: 11.5)).foregroundStyle(Paper.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                if hidden > 0 {
+                    Button(expanded ? "Show fewer" : "+\(hidden) more") { expanded.toggle() }
+                        .buttonStyle(.plain).font(.system(size: 11.5, weight: .medium)).foregroundStyle(Paper.accent)
+                }
+            }
+        }
+    }
+}
+
 private struct MessageReader: View {
     @EnvironmentObject private var store: MailStore
     let message: MailMessage?
@@ -557,11 +615,21 @@ private struct MessageReader: View {
                         }
                         VStack(alignment: .leading, spacing: 2) {
                             Text(message.sender).font(.system(size: 12.5, weight: .semibold))
-                            Text("to me · \(message.senderEmail)").font(.system(size: 11.5)).foregroundStyle(Paper.secondary)
+                            Text(message.senderEmail).font(.system(size: 11.5)).foregroundStyle(Paper.secondary)
+                                .textSelection(.enabled)
                         }
                         Spacer()
                         Text(message.time).font(.system(size: 11.5)).foregroundStyle(Paper.secondary)
                     }.padding(.vertical, 8)
+                    if !message.toRecipients.isEmpty || !message.ccRecipients.isEmpty || !message.bccRecipients.isEmpty {
+                        VStack(alignment: .leading, spacing: 3) {
+                            RecipientLine(label: "To", addresses: message.toRecipients)
+                            RecipientLine(label: "Cc", addresses: message.ccRecipients)
+                            RecipientLine(label: "Bcc", addresses: message.bccRecipients)
+                        }
+                        .padding(.top, 2)
+                        .id(message.id)
+                    }
                     Rectangle().fill(Paper.border).frame(height: 1).padding(.vertical, 13)
                     if store.loadingMessageID == message.id {
                         HStack(spacing: 10) {
@@ -620,6 +688,48 @@ private struct MessageReader: View {
                     } else {
                         Text(PlainTextLinkFormatter.format(message.body)).font(.custom(Paper.mailFont, size: 15)).lineSpacing(7).textSelection(.enabled)
                     }
+                    if !message.attachments.isEmpty {
+                        VStack(alignment: .leading, spacing: 9) {
+                            Label("Attachments (\(message.attachments.count))", systemImage: "paperclip")
+                                .font(.system(size: 12, weight: .semibold))
+                            ForEach(message.attachments) { attachment in
+                                HStack(spacing: 10) {
+                                    Image(systemName: "doc")
+                                        .font(.system(size: 16))
+                                        .foregroundStyle(Paper.accent)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(attachment.fileName)
+                                            .font(.system(size: 11.5, weight: .medium))
+                                            .lineLimit(1)
+                                            .textSelection(.enabled)
+                                        Text("\(attachment.mimeType) · \(ByteCountFormatter.string(fromByteCount: Int64(attachment.encodedSize), countStyle: .file))")
+                                            .font(.system(size: 10.5))
+                                            .foregroundStyle(Paper.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer(minLength: 4)
+                                    if store.activeAttachmentActionID == store.attachmentSaveKey(attachment, message: message) {
+                                        ProgressView().controlSize(.small)
+                                    } else {
+                                        Button("Open") { store.openAttachment(attachment, from: message) }
+                                            .buttonStyle(.bordered).controlSize(.small)
+                                            .disabled(store.activeAttachmentActionID != nil)
+                                        Button("Save") { store.saveAttachment(attachment, from: message) }
+                                            .buttonStyle(.bordered).controlSize(.small)
+                                            .disabled(store.activeAttachmentActionID != nil)
+                                    }
+                                }
+                                .padding(9)
+                                .background(Color.white.opacity(0.65), in: RoundedRectangle(cornerRadius: 8))
+                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Paper.border, lineWidth: 1))
+                            }
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(hex: 0xF4EFE6), in: RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Paper.border, lineWidth: 1))
+                        .padding(.top, 18)
+                    }
                 }
                 .frame(maxWidth: 660, alignment: .leading)
                 .padding(.horizontal, 24).padding(.vertical, 24)
@@ -676,9 +786,9 @@ private struct MessageReader: View {
             }
         } message: {
             if pendingFullMessage?.bodyIsHTML == true {
-                Text("This fetches the complete text part and allows remote images. Image servers may learn your IP address and that you opened the message. Scripts, attachments, remote stylesheets, and automatic link navigation remain blocked.")
+                Text("This fetches the complete text part and allows remote images. Image servers may learn your IP address and that you opened the message. Scripts, automatic link navigation, and remote stylesheets remain blocked. Attachments are only fetched when you choose Save.")
             } else {
-                Text("This fetches the complete text part on demand. It remains in memory only; attachments are not fetched.")
+                Text("This fetches the complete text part on demand. Attachments are listed separately and fetched only when you choose Save.")
             }
         }
     }
@@ -725,11 +835,44 @@ private struct ComposeView: View {
                     recipients: $store.composeTo,
                     suggestionsVisible: $isShowingRecipientSuggestions,
                     containerIdentifier: store.selectedContactsContainerIdentifier,
-                    isDisabled: store.isPreparingCompose || store.isSendingMessage
+                    isDisabled: store.isPreparingCompose || store.isSendingMessage,
+                    label: "To recipients"
                 )
+                if !store.composeShowsCcBcc {
+                    Button("Cc/Bcc") { store.composeShowsCcBcc = true }
+                        .buttonStyle(.plain).font(.system(size: 11.5, weight: .medium)).foregroundStyle(Paper.accent)
+                        .padding(.top, 3)
+                        .help("Add Cc and Bcc recipients")
+                }
             }
             .font(.system(size: 12.5)).padding(.horizontal, 16).padding(.vertical, 10)
             Divider()
+            if store.composeShowsCcBcc {
+                HStack(alignment: .top, spacing: 12) {
+                    Text("Cc").foregroundStyle(Paper.secondary).frame(width: 54, alignment: .leading).padding(.top, 3)
+                    RecipientAutocompleteField(
+                        recipients: $store.composeCc,
+                        suggestionsVisible: $isShowingRecipientSuggestions,
+                        containerIdentifier: store.selectedContactsContainerIdentifier,
+                        isDisabled: store.isPreparingCompose || store.isSendingMessage,
+                        label: "Cc recipients"
+                    )
+                }
+                .font(.system(size: 12.5)).padding(.horizontal, 16).padding(.vertical, 10)
+                Divider()
+                HStack(alignment: .top, spacing: 12) {
+                    Text("Bcc").foregroundStyle(Paper.secondary).frame(width: 54, alignment: .leading).padding(.top, 3)
+                    RecipientAutocompleteField(
+                        recipients: $store.composeBcc,
+                        suggestionsVisible: $isShowingRecipientSuggestions,
+                        containerIdentifier: store.selectedContactsContainerIdentifier,
+                        isDisabled: store.isPreparingCompose || store.isSendingMessage,
+                        label: "Bcc recipients"
+                    )
+                }
+                .font(.system(size: 12.5)).padding(.horizontal, 16).padding(.vertical, 10)
+                Divider()
+            }
             HStack(spacing: 12) {
                 Text("Subject").foregroundStyle(Paper.secondary).frame(width: 54, alignment: .leading)
                 TextField("Subject", text: $store.composeSubject).textFieldStyle(.plain)
@@ -799,6 +942,7 @@ private struct ComposeView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.horizontal, 8).padding(.vertical, 4)
                 .accessibilityLabel("Message body")
+                .help("Paste images with Command-V or right-click and choose Paste. Pasted images are sent inline (4 MiB combined limit).")
                 .disabled(store.isSendingMessage || store.isPreparingCompose)
             if let quotedMessage = store.quotedMessage {
                 VStack(alignment: .leading, spacing: 8) {
@@ -865,9 +1009,11 @@ private struct ComposeView: View {
                     Text(errorMessage).font(.system(size: 11.5)).foregroundStyle(.red).lineLimit(2)
                 } else if let preparationError = store.composePreparationError {
                     Text(preparationError).font(.system(size: 11.5)).foregroundStyle(.red).lineLimit(2)
-                } else if !store.composeTo.isEmpty && GmailSMTPClient.parseRecipients(store.composeTo) == nil {
-                    Text("Enter valid email addresses, separated by commas or semicolons.").font(.system(size: 11.5)).foregroundStyle(.red)
-                } else if store.composeTo.isEmpty {
+                } else if store.composeRecipients == nil {
+                    Text("Enter valid email addresses in To, Cc, and Bcc, separated by commas or semicolons.").font(.system(size: 11.5)).foregroundStyle(.red)
+                } else if store.composeRecipientCount > GmailSMTPClient.maximumRecipients {
+                    Text("Gmail allows up to \(GmailSMTPClient.maximumRecipients) recipients per message.").font(.system(size: 11.5)).foregroundStyle(.red)
+                } else if store.composeRecipientCount == 0 {
                     Text("Separate multiple recipients with commas or semicolons.").font(.system(size: 11.5)).foregroundStyle(Paper.secondary)
                 } else if store.accounts.first(where: { $0.email == store.selectedAccount }).map({ store.hasPassword(for: $0) }) != true {
                     Text("Add an app password in Settings to send mail.").font(.system(size: 11.5)).foregroundStyle(Paper.secondary)
@@ -883,7 +1029,7 @@ private struct ComposeView: View {
         }
         .frame(
             width: 620,
-            height: (store.quotedMessage == nil ? 500 : 700) + (isShowingRecipientSuggestions ? 320 : 0)
+            height: (store.quotedMessage == nil ? 500 : 700) + (store.composeShowsCcBcc ? 90 : 0) + (isShowingRecipientSuggestions ? 320 : 0)
         )
         .background(Paper.reader)
         .environment(\.openURL, OpenURLAction { url in

@@ -21,6 +21,11 @@ struct HackMailApp: App {
                 Button("New Message") { mailStore.beginNewMessage() }
                     .keyboardShortcut("n", modifiers: .command)
             }
+            CommandGroup(replacing: .printItem) {
+                Button("Print Message…") { mailStore.printSelectedMessage() }
+                    .keyboardShortcut("p", modifiers: .command)
+                    .disabled(!mailStore.canPrintSelectedMessage)
+            }
             CommandGroup(after: .appSettings) {
                 Button("Mail Accounts…") { mailStore.showSettings = true }
                     .keyboardShortcut(",", modifiers: .command)
@@ -47,6 +52,10 @@ final class HackMailAppDelegate: NSObject, NSApplicationDelegate, UNUserNotifica
         DispatchQueue.main.async {
             NSApp.activate(ignoringOtherApps: true)
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        OpenedAttachmentFiles.cleanup()
     }
 
     static func updateDockBadge(unreadCount: Int) {

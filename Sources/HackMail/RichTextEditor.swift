@@ -27,7 +27,7 @@ struct RichTextEditor: NSViewRepresentable {
         textView.isGrammarCheckingEnabled = true
         textView.isAutomaticSpellingCorrectionEnabled = false
         textView.allowsUndo = true
-        textView.importsGraphics = false
+        textView.importsGraphics = true
         textView.usesFontPanel = false
         textView.drawsBackground = false
         textView.isVerticallyResizable = true

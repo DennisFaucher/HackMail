@@ -3,20 +3,36 @@ import CoreFoundation
 import Network
 
 struct GmailIMAPClient {
-    func fetchMailbox(email: String, password: String, path: String, limit: Int = 30) async throws -> MailboxSnapshot {
-        try await withSession(email: email, password: password) { session in
+    static let maximumAttachmentDownloadBytes = 25 * 1024 * 1024
+
+    func fetchMailbox(
+        email: String,
+        password: String,
+        path: String,
+        limit: Int = 30,
+        progress: (@Sendable (MailboxLoadProgress) -> Void)? = nil
+    ) async throws -> MailboxSnapshot {
+        try await withSession(email: email, password: password, progress: progress) { session in
             let mailboxes = try await session.fetchMailboxes()
             let messages = try await session.fetchMailbox(path: path, limit: limit)
             return MailboxSnapshot(mailboxes: mailboxes, messages: messages)
         }
     }
 
-    func searchMailbox(email: String, password: String, path: String, query: String, limit: Int = 30) async throws -> MailboxSearchSnapshot {
+    func searchMailbox(
+        email: String,
+        password: String,
+        path: String,
+        query: String,
+        limit: Int = 30,
+        progress: (@Sendable (MailboxLoadProgress) -> Void)? = nil
+    ) async throws -> MailboxSearchSnapshot {
         guard !query.isEmpty, query.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
             throw IMAPError.invalidSearchQuery
         }
-        return try await withSession(email: email, password: password) { session in
+        return try await withSession(email: email, password: password, progress: progress) { session in
             let matchingUIDs = try await session.searchMailbox(path: path, query: query)
+            await session.report(.searchFetchingHeaders)
             let firstPage = Array(matchingUIDs.prefix(max(1, limit)))
             let messages = try await session.fetchMessages(uids: firstPage, mailboxPath: path)
             return MailboxSearchSnapshot(matchingUIDs: matchingUIDs, messages: messages)
@@ -110,6 +126,27 @@ struct GmailIMAPClient {
         }
     }
 
+    func fetchAttachment(
+        uid: Int,
+        mailboxPath: String,
+        attachment: MailAttachmentInfo,
+        email: String,
+        password: String
+    ) async throws -> Data {
+        guard attachment.encodedSize <= Self.maximumAttachmentDownloadBytes else {
+            throw IMAPError.attachmentTooLarge
+        }
+        return try await withSession(email: email, password: password) { session in
+            try await session.selectMailbox(path: mailboxPath)
+            return try await session.fetchAttachment(
+                uid: uid,
+                section: attachment.section,
+                transferEncoding: attachment.transferEncoding,
+                maximumBytes: Self.maximumAttachmentDownloadBytes
+            )
+        }
+    }
+
     func archive(uid: Int, mailboxPath: String, email: String, password: String) async throws {
         try await withSession(email: email, password: password) { session in
             try await session.selectMailbox(path: mailboxPath)
@@ -193,16 +230,21 @@ struct GmailIMAPClient {
         email: String,
         password: String,
         shouldLogout: Bool = true,
+        progress: (@Sendable (MailboxLoadProgress) -> Void)? = nil,
         operation: @Sendable (IMAPSession) async throws -> T
     ) async throws -> T {
         let session = IMAPSession()
+        await session.setProgress(progress)
         return try await withTaskCancellationHandler {
             do {
                 try Task.checkCancellation()
                 try await session.open(email: email, password: password)
                 let result = try await operation(session)
                 try Task.checkCancellation()
-                if shouldLogout { try await session.logout() }
+                if shouldLogout {
+                    await session.report(.signingOut)
+                    try await session.logout()
+                }
                 await session.close()
                 return result
             } catch {
@@ -224,6 +266,26 @@ enum IMAPCommandText {
         }
         return "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
     }
+}
+
+/// One serial stage of loading a mailbox, reported so the UI can show what is happening.
+struct MailboxLoadProgress: Sendable, Equatable {
+    static let totalSteps = 6
+    static let connecting = MailboxLoadProgress(step: 1, text: "Connecting securely to Gmail…")
+    static let signingIn = MailboxLoadProgress(step: 2, text: "Signing in…")
+    static let listingFolders = MailboxLoadProgress(step: 3, text: "Loading your folder list…")
+    static let openingMailbox = MailboxLoadProgress(step: 4, text: "Opening the folder…")
+    static let fetchingHeaders = MailboxLoadProgress(step: 5, text: "Fetching the newest messages…")
+    static let signingOut = MailboxLoadProgress(step: 6, text: "Signing out…")
+    // A folder search runs the same six stages in a different order after sign-in.
+    static let searchOpeningFolder = MailboxLoadProgress(step: 3, text: "Opening the folder…")
+    static let searching = MailboxLoadProgress(step: 4, text: "Gmail is searching this folder (large folders can take a while)…")
+    static let searchFetchingHeaders = MailboxLoadProgress(step: 5, text: "Fetching the first matching messages…")
+
+    let step: Int
+    let text: String
+
+    var displayText: String { "Step \(step) of \(Self.totalSteps) · \(text)" }
 }
 
 struct MailboxSnapshot: Sendable {
@@ -256,6 +318,7 @@ struct FetchedMessageBody: Sendable {
     let content: String
     let isHTML: Bool
     let isPartial: Bool
+    var attachments: [MailAttachmentInfo] = []
 }
 
 private enum IMAPError: LocalizedError {
@@ -264,6 +327,7 @@ private enum IMAPError: LocalizedError {
     case authentication
     case noInbox
     case invalidSearchQuery
+    case attachmentTooLarge
     case timeout
     case responseTooLarge
     case invalidCommandText
@@ -274,10 +338,11 @@ private enum IMAPError: LocalizedError {
         case .protocolError(let detail): "Gmail returned an unexpected IMAP response: \(detail)"
         case .authentication: "Gmail rejected the app password. Check the address and app password in Account Settings."
         case .noInbox: "Gmail did not return an Inbox mailbox."
+        case .invalidSearchQuery: "Enter a Gmail search query without line breaks or control characters."
+        case .attachmentTooLarge: "This attachment exceeds HackMail's 25 MiB download limit."
         case .timeout: "Gmail did not respond in time. Check your connection and try again."
         case .invalidCommandText: "A value contained line breaks or control characters and was not sent to Gmail."
         case .responseTooLarge: "Gmail sent a response larger than HackMail accepts, so the request was stopped."
-        case .invalidSearchQuery: "Enter a Gmail search query without line breaks or control characters."
         }
     }
 }
@@ -303,12 +368,14 @@ private actor IMAPSession {
     // buggy server must not be able to grow memory without bound.
     private static let connectTimeout: Duration = .seconds(20)
     private static let defaultReceiveTimeout: Duration = .seconds(30)
+    private static let searchReceiveTimeout: Duration = .seconds(180)
     private static let maximumLineBytes = 2 * 1024 * 1024
     private static let maximumLiteralBytes = 32 * 1024 * 1024
     private static let maximumResponseBytes = 64 * 1024 * 1024
 
     private let queue = DispatchQueue(label: "HackMail.GmailIMAP")
     private var receiveTimeout: Duration = IMAPSession.defaultReceiveTimeout
+    private var progress: (@Sendable (MailboxLoadProgress) -> Void)?
     private var connection: NWConnection?
     private var buffered = Data()
     private var nextTag = 1
@@ -316,7 +383,16 @@ private actor IMAPSession {
     private var activeIdleTag: String?
     private var didSendIdleDone = false
 
+    func setProgress(_ progress: (@Sendable (MailboxLoadProgress) -> Void)?) {
+        self.progress = progress
+    }
+
+    func report(_ step: MailboxLoadProgress) {
+        progress?(step)
+    }
+
     func open(email: String, password: String) async throws {
+        report(.connecting)
         let endpoint = NWEndpoint.Host("imap.gmail.com")
         guard let port = NWEndpoint.Port(rawValue: 993) else {
             throw IMAPError.connection("Invalid IMAP port.")
@@ -352,6 +428,7 @@ private actor IMAPSession {
         guard greeting.uppercased().contains("* OK") else {
             throw IMAPError.protocolError(greeting)
         }
+        report(.signingIn)
         do {
             _ = try await command("LOGIN \(try quote(email)) \(try quote(password))")
         } catch IMAPError.protocolError(let detail) where detail.localizedCaseInsensitiveContains("NO") || detail.localizedCaseInsensitiveContains("AUTHENTICATIONFAILED") {
@@ -360,6 +437,7 @@ private actor IMAPSession {
     }
 
     func fetchMailboxes() async throws -> [MailMailbox] {
+        report(.listingFolders)
         let response = try await command("LIST \"\" \"*\"")
         return response.lines.compactMap(IMAPServerResponseParser.parseMailbox)
             .filter { !$0.attributes.contains(where: { $0.caseInsensitiveCompare("\\Noselect") == .orderedSame }) }
@@ -372,8 +450,10 @@ private actor IMAPSession {
     func fetchMailbox(path: String, limit: Int) async throws -> [MailMessage] {
         // Fetch the newest messages by sequence number. UID SEARCH ALL returns every UID in the
         // mailbox, which is slow (and a huge single response) for large folders like Archive.
+        report(.openingMailbox)
         let total = try await selectMailboxAndGetMessageCount(path: path)
         guard total > 0 else { return [] }
+        report(.fetchingHeaders)
         let first = max(1, total - max(1, limit) + 1)
         let response = try await command("FETCH \(first):\(total) (UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE)")
         return response.lines.compactMap { IMAPServerResponseParser.parseMessage($0, mailboxPath: path) }
@@ -397,7 +477,13 @@ private actor IMAPSession {
     }
 
     func searchMailbox(path: String, query: String) async throws -> [Int] {
+        report(.searchOpeningFolder)
         try await selectMailbox(path: path)
+        report(.searching)
+        // Gmail sends nothing until the search finishes, which can take a long time on a big folder.
+        // Allow a generous silent period; the user can still cancel from the UI.
+        receiveTimeout = Self.searchReceiveTimeout
+        defer { receiveTimeout = Self.defaultReceiveTimeout }
         let response = try await command("UID SEARCH X-GM-RAW \(try quote(query))")
         return IMAPServerResponseParser.parseSearchUIDs(response.lines).sorted(by: >)
     }
@@ -406,7 +492,7 @@ private actor IMAPSession {
         guard !uids.isEmpty else { return [] }
         try await selectMailbox(path: mailboxPath)
         let uidSet = uids.map(String.init).joined(separator: ",")
-        let response = try await command("UID FETCH \(uidSet) (UID FLAGS INTERNALDATE ENVELOPE)")
+        let response = try await command("UID FETCH \(uidSet) (UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE)")
         return response.lines.compactMap { IMAPServerResponseParser.parseMessage($0, mailboxPath: mailboxPath) }
             .sorted { $0.id > $1.id }
     }
@@ -497,13 +583,14 @@ private actor IMAPSession {
     }
 
     func fetchBody(uid: Int, full: Bool, preferHTML: Bool) async throws -> FetchedMessageBody {
-        // Resolve the MIME structure first, then fetch only a text part on demand. No
-        // attachment parts are requested or written to disk.
+        // Resolve MIME metadata first, then fetch only the selected text part and CID images.
+        // Regular attachment bytes are fetched only after an explicit user save action.
         let structureResponse = try await command("UID FETCH \(uid) (BODYSTRUCTURE)")
         guard let structure = Self.parseBodyStructure(structureResponse.lines),
               let bodyPart = Self.preferredTextPart(in: structure, preferHTML: preferHTML) else {
             throw IMAPError.protocolError("This message has no supported plain-text or HTML body part.")
         }
+        let attachments = IMAPAttachmentParser.parse(structureResponse.lines)
         let section = bodyPart.section.isEmpty ? "TEXT" : bodyPart.section
         let bodySection = full ? "BODY.PEEK[\(section)]" : "BODY.PEEK[\(section)]<0.65536>"
         let response = try await command("UID FETCH \(uid) (\(bodySection))")
@@ -520,10 +607,33 @@ private actor IMAPSession {
             isHTML: bodyPart.isHTML,
             isPartial: !full && literal.count >= 65_536
         )
-        guard bodyPart.isHTML, !bodyPart.inlineImages.isEmpty else { return fetchedBody }
+        guard bodyPart.isHTML, !bodyPart.inlineImages.isEmpty else {
+            return FetchedMessageBody(
+                content: fetchedBody.content,
+                isHTML: fetchedBody.isHTML,
+                isPartial: fetchedBody.isPartial,
+                attachments: attachments
+            )
+        }
         let inlineImages = try await fetchInlineImages(uid: uid, parts: bodyPart.inlineImages)
         let html = IMAPInlineImageResolver.replacingCIDReferences(in: fetchedBody.content, with: inlineImages)
-        return FetchedMessageBody(content: html, isHTML: true, isPartial: fetchedBody.isPartial)
+        return FetchedMessageBody(content: html, isHTML: true, isPartial: fetchedBody.isPartial, attachments: attachments)
+    }
+
+    func fetchAttachment(uid: Int, section: String, transferEncoding: String, maximumBytes: Int) async throws -> Data {
+        guard section.range(of: #"^[0-9]+(?:\.[0-9]+)*$"#, options: .regularExpression) != nil else {
+            throw IMAPError.protocolError("Gmail returned an invalid attachment part number.")
+        }
+        let response = try await command("UID FETCH \(uid) (BODY.PEEK[\(section)])")
+        guard let encoded = response.segments.compactMap({ segment -> Data? in
+            guard case .literal(let data) = segment else { return nil }
+            return data
+        }).first else {
+            throw IMAPError.protocolError("Gmail returned no attachment data.")
+        }
+        let decoded = Self.decodeTransferData(encoded, encoding: transferEncoding)
+        guard decoded.count <= maximumBytes else { throw IMAPError.attachmentTooLarge }
+        return decoded
     }
 
     private func fetchInlineImages(uid: Int, parts: [IMAPInlineImage]) async throws -> [String: String] {
@@ -1086,8 +1196,25 @@ enum IMAPServerResponseParser {
             unread: !flags.contains(where: { $0.caseInsensitiveCompare("\\Seen") == .orderedSame }),
             flagged: flags.contains(where: { $0.caseInsensitiveCompare("\\Flagged") == .orderedSame }),
             isRemote: true,
-            mailboxPath: mailboxPath
+            mailboxPath: mailboxPath,
+            attachments: IMAPAttachmentParser.parse([line]),
+            toRecipients: envelope.count > 5 ? addressList(envelope[5]) : [],
+            ccRecipients: envelope.count > 6 ? addressList(envelope[6]) : [],
+            bccRecipients: envelope.count > 7 ? addressList(envelope[7]) : []
         )
+    }
+
+    /// Every usable address in an ENVELOPE address list. Group start/end markers (no mailbox or host) are skipped.
+    fileprivate static func addressList(_ value: IMAPValue) -> [MailAddress] {
+        guard case .list(let entries) = value else { return [] }
+        return entries.compactMap { entry in
+            guard case .list(let address) = entry, address.count >= 4 else { return nil }
+            let mailbox = address[2].stringValue ?? ""
+            let host = address[3].stringValue ?? ""
+            guard !mailbox.isEmpty, !host.isEmpty else { return nil }
+            let name = address[0].stringValue ?? ""
+            return MailAddress(name: decodeHeader(name) ?? name, email: "\(mailbox)@\(host)")
+        }
     }
 
     private static func addresses(_ value: IMAPValue) -> (name: String, email: String) {
@@ -1124,7 +1251,7 @@ enum IMAPServerResponseParser {
         return formatter.string(from: date)
     }
 
-    private static func decodeHeader(_ value: String) -> String? {
+    static func decodeHeader(_ value: String) -> String? {
         let pattern = #"=\?([^?]+)\?([bBqQ])\?([^?]*)\?="#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return value }
         let nsValue = value as NSString
@@ -1242,5 +1369,127 @@ private struct IMAPTokenizer {
         case .atom(let value):
             return value.caseInsensitiveCompare("NIL") == .orderedSame ? .nilValue : .atom(value)
         }
+    }
+}
+
+enum IMAPAttachmentParser {
+    static func parse(_ lines: [String]) -> [MailAttachmentInfo] {
+        guard let structure = bodyStructure(in: lines) else { return [] }
+        var attachments: [MailAttachmentInfo] = []
+        collectAttachments(in: structure, section: "", into: &attachments)
+        return attachments
+    }
+
+    private static func bodyStructure(in lines: [String]) -> IMAPValue? {
+        for line in lines {
+            let tokens = IMAPTokenizer(line).tokens
+            guard tokens.count > 4, tokens[0] == .atom("*"), tokens[2] == .atom("FETCH") else { continue }
+            var cursor = 4
+            while cursor < tokens.count, tokens[cursor] != .rightParen {
+                guard case .atom(let key) = tokens[cursor] else { cursor += 1; continue }
+                cursor += 1
+                guard let value = IMAPTokenizer.parseValue(tokens, cursor: &cursor) else { break }
+                if key.caseInsensitiveCompare("BODYSTRUCTURE") == .orderedSame { return value }
+            }
+        }
+        return nil
+    }
+
+    private static func collectAttachments(in value: IMAPValue, section: String, into attachments: inout [MailAttachmentInfo]) {
+        guard case .list(let values) = value, !values.isEmpty else { return }
+        var children: [IMAPValue] = []
+        for item in values {
+            guard case .list = item else { break }
+            children.append(item)
+        }
+
+        if !children.isEmpty {
+            let multipartParameters = values.dropFirst(children.count + 1).first.map(parameterDictionary) ?? [:]
+            let disposition = disposition(in: values.dropFirst(children.count + 1))
+            let filename = disposition?.parameters["filename"] ?? multipartParameters["name"]
+            if disposition?.type == "attachment" || filename != nil {
+                let subtype = values.dropFirst(children.count).first?.stringValue?.lowercased() ?? "mixed"
+                appendAttachment(
+                    section: section,
+                    filename: filename,
+                    mimeType: "multipart/\(subtype)",
+                    size: 0,
+                    encoding: "binary",
+                    to: &attachments
+                )
+                return
+            }
+
+            for (index, child) in children.enumerated() {
+                let childSection = section.isEmpty ? String(index + 1) : "\(section).\(index + 1)"
+                collectAttachments(in: child, section: childSection, into: &attachments)
+            }
+            return
+        }
+
+        guard values.count >= 7,
+              let mediaType = values[0].stringValue?.lowercased(),
+              let subtype = values[1].stringValue?.lowercased() else { return }
+        let parameters = parameterDictionary(values[2])
+        let disposition = disposition(in: values.dropFirst(7))
+        let filename = disposition?.parameters["filename"] ?? parameters["name"]
+        let contentID = values[3].stringValue
+        let isExplicitAttachment = disposition?.type == "attachment"
+        let isNamedAttachment = filename != nil && !(contentID != nil && disposition?.type == "inline")
+        guard isExplicitAttachment || isNamedAttachment else { return }
+
+        let size = values[6].stringValue.flatMap(Int.init) ?? 0
+        appendAttachment(
+            section: section.isEmpty ? "1" : section,
+            filename: filename,
+            mimeType: "\(mediaType)/\(subtype)",
+            size: size,
+            encoding: values[5].stringValue?.lowercased() ?? "7bit",
+            to: &attachments
+        )
+    }
+
+    private static func appendAttachment(
+        section: String,
+        filename: String?,
+        mimeType: String,
+        size: Int,
+        encoding: String,
+        to attachments: inout [MailAttachmentInfo]
+    ) {
+        guard !section.isEmpty else { return }
+        let normalizedFilename = filename.flatMap(IMAPServerResponseParser.decodeHeader) ?? filename
+        let safeFilename = normalizedFilename?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallbackName = "attachment-\(section.replacingOccurrences(of: ".", with: "-")).bin"
+        attachments.append(MailAttachmentInfo(
+            section: section,
+            fileName: (safeFilename?.isEmpty == false ? safeFilename : nil) ?? fallbackName,
+            mimeType: mimeType,
+            encodedSize: max(0, size),
+            transferEncoding: encoding
+        ))
+    }
+
+    private static func disposition(in values: some Collection<IMAPValue>) -> (type: String, parameters: [String: String])? {
+        for value in values {
+            guard case .list(let items) = value,
+                  let type = items.first?.stringValue?.lowercased(),
+                  type == "attachment" || type == "inline" else { continue }
+            return (type, items.dropFirst().first.map(parameterDictionary) ?? [:])
+        }
+        return nil
+    }
+
+    private static func parameterDictionary(_ value: IMAPValue) -> [String: String] {
+        guard case .list(let items) = value else { return [:] }
+        var result: [String: String] = [:]
+        var index = 0
+        while index + 1 < items.count {
+            if let key = items[index].stringValue?.lowercased(), let value = items[index + 1].stringValue {
+                result[key] = value
+            }
+            index += 2
+        }
+        return result
     }
 }

@@ -11,13 +11,23 @@ struct GmailSMTPClient: Sendable {
         return raw
     }
 
+    /// Like `parseRecipients`, but an empty field is valid and yields no addresses (for Cc and Bcc).
+    static func parseOptionalRecipients(_ input: String) -> [String]? {
+        input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? [] : parseRecipients(input)
+    }
+
+    /// Gmail rejects messages with more recipients than this across To, Cc, and Bcc.
+    static let maximumRecipients = 100
+
     static func isValidEmail(_ email: String) -> Bool {
         let pattern = #"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"#
         return email.range(of: pattern, options: .regularExpression) != nil
     }
 
-    func send(from: String, fromName: String, password: String, to recipients: [String], subject: String, body: OutgoingEmailBody, attachments: [MailAttachment]) async throws {
-        guard Self.isValidEmail(from), !recipients.isEmpty, recipients.allSatisfy(Self.isValidEmail),
+    func send(from: String, fromName: String, password: String, to recipients: [String], cc: [String] = [], bcc: [String] = [], subject: String, body: OutgoingEmailBody, attachments: [MailAttachment]) async throws {
+        let envelope = SMTPMessageBuilder.envelopeRecipients(to: recipients, cc: cc, bcc: bcc)
+        guard envelope.count <= Self.maximumRecipients else { throw SMTPError.tooManyRecipients }
+        guard Self.isValidEmail(from), !envelope.isEmpty, envelope.allSatisfy(Self.isValidEmail),
               fromName.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }),
               subject.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
             throw SMTPError.invalidMessage
@@ -26,7 +36,7 @@ struct GmailSMTPClient: Sendable {
         do {
             try await session.open()
             try await session.authenticate(email: from, password: password)
-            try await session.sendMessage(from: from, fromName: fromName, recipients: recipients, subject: subject, body: body, attachments: attachments)
+            try await session.sendMessage(from: from, fromName: fromName, recipients: recipients, cc: cc, envelope: envelope, subject: subject, body: body, attachments: attachments)
             // A final 250 response means Gmail accepted the message. QUIT failure after that
             // must not make the UI suggest retrying, which could send a duplicate.
             try? await session.quit()
@@ -39,7 +49,14 @@ struct GmailSMTPClient: Sendable {
 }
 
 enum SMTPMessageBuilder {
-    static func build(from: String, fromName: String, recipients: [String], subject: String, body: OutgoingEmailBody, attachments: [MailAttachment] = []) -> String {
+    /// Every address that must receive the message at the SMTP level: To, Cc, and Bcc, without duplicates.
+    /// Bcc addresses are used only here and are never written into the message headers.
+    static func envelopeRecipients(to: [String], cc: [String], bcc: [String]) -> [String] {
+        var seen = Set<String>()
+        return (to + cc + bcc).filter { seen.insert($0.lowercased()).inserted }
+    }
+
+    static func build(from: String, fromName: String, recipients: [String], cc: [String] = [], subject: String, body: OutgoingEmailBody, attachments: [MailAttachment] = []) -> String {
         let dateFormatter = DateFormatter()
         dateFormatter.locale = Locale(identifier: "en_US_POSIX")
         dateFormatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
@@ -82,15 +99,20 @@ enum SMTPMessageBuilder {
             contentType = "multipart/alternative; boundary=\"\(alternativeBoundary)\""
             content = alternative
         }
-        let headers = [
+        let toHeader = recipients.isEmpty
+            ? "To: undisclosed-recipients:;"
+            : "To: \(recipients.map { "<\($0)>" }.joined(separator: ", "))"
+        let ccHeader = cc.isEmpty ? [] : ["Cc: \(cc.map { "<\($0)>" }.joined(separator: ", "))"]
+        let headers = ([
             "From: \(fromHeader)",
-            "To: \(recipients.map { "<\($0)>" }.joined(separator: ", "))",
+            toHeader
+        ] + ccHeader + [
             "Date: \(dateFormatter.string(from: Date()))",
             "Message-ID: \(messageID)",
             "Subject: \(subjectHeader)",
             "MIME-Version: 1.0",
             "Content-Type: \(contentType)"
-        ].joined(separator: "\r\n")
+        ]).joined(separator: "\r\n")
         return headers + "\r\n\r\n" + content
     }
 
@@ -200,6 +222,7 @@ private enum SMTPError: LocalizedError {
     case deliveryUncertain
     case timeout
     case responseTooLarge
+    case tooManyRecipients
 
     var errorDescription: String? {
         switch self {
@@ -210,6 +233,7 @@ private enum SMTPError: LocalizedError {
         case .invalidMessage: "Enter a valid sender, recipient, and single-line subject. Separate recipients with commas."
         case .deliveryUncertain: "The connection ended while Gmail was acknowledging the message. Check Sent before retrying to avoid a duplicate."
         case .timeout: "Gmail SMTP did not respond in time. Check your connection and try again."
+        case .tooManyRecipients: "Gmail allows up to 100 recipients per message across To, Cc, and Bcc."
         case .responseTooLarge: "Gmail SMTP sent a response larger than HackMail accepts, so sending was stopped."
         }
     }
@@ -284,17 +308,17 @@ private actor SMTPSession {
         }
     }
 
-    func sendMessage(from: String, fromName: String, recipients: [String], subject: String, body: OutgoingEmailBody, attachments: [MailAttachment]) async throws {
+    func sendMessage(from: String, fromName: String, recipients: [String], cc: [String], envelope: [String], subject: String, body: OutgoingEmailBody, attachments: [MailAttachment]) async throws {
         let senderResponse = try await command("MAIL FROM:<\(from)>")
         try require(senderResponse, codes: [250])
-        for recipient in recipients {
+        for recipient in envelope {
             let recipientResponse = try await command("RCPT TO:<\(recipient)>")
             try require(recipientResponse, codes: [250, 251])
         }
         let dataResponse = try await command("DATA")
         try require(dataResponse, codes: [354])
 
-        let payload = SMTPMessageBuilder.build(from: from, fromName: fromName, recipients: recipients, subject: subject, body: body, attachments: attachments)
+        let payload = SMTPMessageBuilder.build(from: from, fromName: fromName, recipients: recipients, cc: cc, subject: subject, body: body, attachments: attachments)
         do {
             try await send(payload + ".\r\n")
             receiveTimeout = Self.acceptanceTimeout

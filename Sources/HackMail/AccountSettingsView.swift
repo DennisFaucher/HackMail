@@ -16,6 +16,8 @@ struct AccountSettingsView: View {
     @State private var isLoadingContactsLists = false
     @State private var contactsErrorMessage: String?
 
+    private let suggestedEmails = PersonalDefaults.suggestedAddresses
+
     var body: some View {
         ScrollView {
         VStack(alignment: .leading, spacing: 18) {
@@ -90,6 +92,20 @@ struct AccountSettingsView: View {
                 HStack {
                     Text("Add or update account").font(.system(size: 14, weight: .semibold))
                     Spacer()
+                    if !suggestedEmails.isEmpty {
+                    Menu("Use one of my addresses") {
+                        ForEach(suggestedEmails, id: \.self) { address in
+                            Button(address) {
+                                email = address
+                                let existing = store.accounts.first(where: { $0.email.caseInsensitiveCompare(address) == .orderedSame })
+                                fullName = existing?.fullName
+                                    ?? MailAccount.suggestedFullName(for: address)
+                                signature = existing?.signature ?? ""
+                            }
+                        }
+                    }
+                    .font(.system(size: 11.5))
+                    }
                 }
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Gmail address").font(.system(size: 11.5, weight: .medium)).foregroundStyle(Paper.secondary)
@@ -97,7 +113,7 @@ struct AccountSettingsView: View {
                 }
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Full name shown to recipients").font(.system(size: 11.5, weight: .medium)).foregroundStyle(Paper.secondary)
-                    TextField("Your name", text: $fullName).textFieldStyle(.roundedBorder).textContentType(.name)
+                    TextField(PersonalDefaults.fullNamePlaceholder, text: $fullName).textFieldStyle(.roundedBorder).textContentType(.name)
                 }
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Email signature (optional)").font(.system(size: 11.5, weight: .medium)).foregroundStyle(Paper.secondary)

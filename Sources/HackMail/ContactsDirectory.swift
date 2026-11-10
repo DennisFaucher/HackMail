@@ -189,6 +189,7 @@ struct RecipientAutocompleteField: View {
     @Binding var suggestionsVisible: Bool
     let containerIdentifier: String?
     let isDisabled: Bool
+    var label = "Recipients"
 
     @StateObject private var autocomplete = ContactAutocompleteModel()
     @FocusState private var isFieldFocused: Bool
@@ -198,7 +199,7 @@ struct RecipientAutocompleteField: View {
             TextField("name@example.com (separate with commas or semicolons)", text: $recipients)
                 .textFieldStyle(.plain)
                 .textContentType(.emailAddress)
-                .accessibilityLabel("Recipients")
+                .accessibilityLabel(label)
                 .focused($isFieldFocused)
                 .disabled(isDisabled)
                 .onChange(of: recipients) { _, newValue in

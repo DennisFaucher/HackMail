@@ -1,13 +1,16 @@
 import XCTest
+import AppKit
 @testable import HackMail
 
 final class AccountAndMailTests: XCTestCase {
-    func testLegacyAccountSettingsDoNotSuggestPersonalNames() throws {
-        let legacyJSON = #"[{"email":"owner@example.com"},{"email":"person@gmail.com"}]"#
+    func testLegacyAccountSettingsGetSuggestedNameOnlyWhenConfigured() throws {
+        let addresses = PersonalDefaults.suggestedAddresses + ["owner@example.com"]
+        let legacyJSON = "[" + addresses.map { #"{"email":"\#($0)"}"# }.joined(separator: ",") + "]"
         let accounts = try JSONDecoder().decode([MailAccount].self, from: Data(legacyJSON.utf8))
 
-        XCTAssertEqual(accounts.map(\.fullName), ["", ""])
-        XCTAssertEqual(accounts.map(\.signature), ["", ""])
+        XCTAssertEqual(accounts.map(\.fullName), addresses.map(PersonalDefaults.suggestedFullName(for:)))
+        XCTAssertEqual(accounts.last?.fullName, "")
+        XCTAssertEqual(accounts.map(\.signature), addresses.map { _ in "" })
     }
 
     func testFullNameRoundTripsWithAccountSettings() throws {
@@ -39,7 +42,7 @@ final class AccountAndMailTests: XCTestCase {
 
     func testRecipientAutocompleteUsesOnlyTheActiveAddressToken() {
         XCTAssertEqual(RecipientAddressCompletion.activeToken(in: "first@example.com, alex"), "alex")
-        XCTAssertEqual(RecipientAddressCompletion.activeToken(in: "first@example.com;  DEN"), "DEN")
+        XCTAssertEqual(RecipientAddressCompletion.activeToken(in: "first@example.com;  ALE"), "ALE")
         XCTAssertEqual(
             RecipientAddressCompletion.replacingActiveToken(in: "first@example.com, alex", with: "alex@example.com"),
             "first@example.com, alex@example.com, "
@@ -125,6 +128,36 @@ final class AccountAndMailTests: XCTestCase {
         )
         let encodedHTML = Data(rewrittenHTML.utf8).base64EncodedString()
         XCTAssertTrue(message.replacingOccurrences(of: "\r\n", with: "").contains(encodedHTML))
+    }
+
+    @MainActor
+    func testPastedInlineImageIsEmbeddedAndSentAsRelatedMIMEPart() throws {
+        let image = NSImage(size: NSSize(width: 16, height: 16))
+        image.lockFocus()
+        NSColor.systemBlue.setFill()
+        NSBezierPath(rect: NSRect(x: 0, y: 0, width: 16, height: 16)).fill()
+        image.unlockFocus()
+
+        let attachment = NSTextAttachment()
+        attachment.image = image
+        let attributedBody = NSMutableAttributedString(string: "Before ")
+        attributedBody.append(NSAttributedString(attachment: attachment))
+        attributedBody.append(NSAttributedString(string: " after"))
+
+        let body = try ComposeInlineImageProcessor.process(attributedBody)
+        let message = SMTPMessageBuilder.build(
+            from: "sender@example.com",
+            fromName: "Example Sender",
+            recipients: ["friend@example.com"],
+            subject: "Image",
+            body: body
+        )
+
+        XCTAssertTrue(body.html.contains("data:image/png;base64,"))
+        XCTAssertFalse(body.html.contains("file://"))
+        XCTAssertTrue(body.plainText.contains("[Inline image]"))
+        XCTAssertTrue(message.contains("multipart/related"))
+        XCTAssertTrue(message.contains("Content-ID: <hackmail-inline-"))
     }
 
     func testAttachmentLoaderReadsSelectedFileIntoMemory() throws {
@@ -233,6 +266,42 @@ final class AccountAndMailTests: XCTestCase {
         XCTAssertEqual(message?.mailboxPath, "INBOX")
     }
 
+    func testIMAPBodyStructureListsNamedAttachmentsButNotInlineCIDImages() {
+        let attachments = IMAPAttachmentParser.parse([
+            #"* 4 FETCH (UID 99 BODYSTRUCTURE (("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 10 1 NIL NIL NIL) ("APPLICATION" "OCTET-STREAM" ("NAME" "notes.md") NIL NIL "BASE64" 12 ("ATTACHMENT" ("FILENAME" "notes.md")) NIL NIL) "MIXED" ("BOUNDARY" "mixed") NIL NIL))"#
+        ])
+
+        XCTAssertEqual(attachments, [MailAttachmentInfo(
+            section: "2",
+            fileName: "notes.md",
+            mimeType: "application/octet-stream",
+            encodedSize: 12,
+            transferEncoding: "base64"
+        )])
+
+        let inlineImages = IMAPAttachmentParser.parse([
+            #"* 4 FETCH (UID 99 BODYSTRUCTURE (("TEXT" "HTML" ("CHARSET" "UTF-8") NIL NIL "7BIT" 20 1 NIL NIL NIL) ("IMAGE" "PNG" ("NAME" "image.png") "<image-cid>" NIL "BASE64" 12 ("INLINE" ("FILENAME" "image.png")) NIL NIL) "RELATED" ("BOUNDARY" "related") NIL NIL))"#
+        ])
+        XCTAssertTrue(inlineImages.isEmpty)
+    }
+
+    func testIMAPAttachmentParserDecodesEncodedFilename() {
+        let attachments = IMAPAttachmentParser.parse([
+            #"* 4 FETCH (UID 99 BODYSTRUCTURE (("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 10 1 NIL NIL NIL) ("IMAGE" "PNG" ("NAME" "=?UTF-8?Q?Screenshot_2026-11-08_at_6.44.10=E2=80=AFPM.png?=") NIL NIL "BASE64" 12 ("ATTACHMENT" ("FILENAME" "=?UTF-8?Q?Screenshot_2026-11-08_at_6.44.10=E2=80=AFPM.png?=")) NIL NIL) "MIXED" ("BOUNDARY" "mixed") NIL NIL))"#
+        ])
+
+        XCTAssertEqual(attachments.first?.fileName, "Screenshot 2026-11-08 at 6.44.10\u{202F}PM.png")
+    }
+
+    func testFetchedMessageHeaderCarriesAttachmentIndicatorMetadata() throws {
+        let line = #"* 4 FETCH (UID 99 FLAGS () INTERNALDATE "08-Nov-2026 20:00:00 +0000" ENVELOPE ("Sun, 8 Nov 2026 20:00:00 +0000" "Notes" (("Alex" NIL "alex" "example.test")) NIL NIL NIL NIL NIL NIL "<notes@example.test>") BODYSTRUCTURE (("TEXT" "PLAIN" ("CHARSET" "UTF-8") NIL NIL "7BIT" 10 1 NIL NIL NIL) ("TEXT" "PLAIN" ("CHARSET" "UTF-8" "NAME" "notes.md") NIL NIL "BASE64" 12 ("ATTACHMENT" ("FILENAME" "notes.md")) NIL NIL) "MIXED" ("BOUNDARY" "mixed") NIL NIL))"#
+
+        let message = try XCTUnwrap(IMAPServerResponseParser.parseMessage(line, mailboxPath: "INBOX"))
+
+        XCTAssertTrue(message.hasAttachments)
+        XCTAssertEqual(message.attachments.first?.fileName, "notes.md")
+    }
+
     func testIMAPSearchResponseParsesAndDeduplicatesMatchingUIDs() {
         let uids = IMAPServerResponseParser.parseSearchUIDs([
             "* SEARCH 12 25 40",
@@ -337,8 +406,18 @@ final class AccountAndMailTests: XCTestCase {
         )
 
         XCTAssertEqual(resolved, #"<img src="data:image/jpeg;base64,AAEC"><img src="cid:other">"#)
+        }
     }
-}
+
+    func testOpenedAttachmentTemporaryFileIsRemovedOnCleanup() throws {
+        let contents = Data("temporary preview".utf8)
+        let url = try OpenedAttachmentFiles.write(contents, fileName: "notes.md")
+        defer { OpenedAttachmentFiles.cleanup() }
+
+        XCTAssertEqual(try Data(contentsOf: url), contents)
+        OpenedAttachmentFiles.cleanup()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
 
 final class MailStoreNavigationTests: XCTestCase {
     @MainActor
@@ -526,5 +605,93 @@ final class MailStoreNavigationTests: XCTestCase {
         }
         XCTAssertEqual(decoded, subject)
         XCTAssertEqual(SMTPMessageBuilder.encodedSubject("Plain subject"), "Plain subject")
+    }
+
+    func testMailboxLoadProgressDescribesEachSerialStep() {
+        XCTAssertEqual(MailboxLoadProgress.connecting.displayText, "Step 1 of 6 · Connecting securely to Gmail…")
+        XCTAssertEqual(MailboxLoadProgress.signingOut.step, MailboxLoadProgress.totalSteps)
+    }
+
+    func testSearchProgressStepsAreOrderedAndWithinTotal() {
+        let searchSteps: [MailboxLoadProgress] = [
+            .connecting, .signingIn, .searchOpeningFolder, .searching, .searchFetchingHeaders, .signingOut
+        ]
+        XCTAssertEqual(searchSteps.map(\.step), [1, 2, 3, 4, 5, 6])
+        XCTAssertEqual(searchSteps.last?.step, MailboxLoadProgress.totalSteps)
+        XCTAssertTrue(MailboxLoadProgress.searching.displayText.hasPrefix("Step 4 of 6 · "))
+    }
+
+    func testEnvelopeParsesToAndCcRecipientsAndSkipsGroupMarkers() throws {
+        let response = #"* 9 FETCH (UID 77 FLAGS () INTERNALDATE "06-Nov-2026 15:30:00 +0000" ENVELOPE ("Fri, 6 Nov 2026 15:30:00 +0000" "Hi" (("Alice" NIL "alice" "example.com")) NIL NIL (("Bob Smith" NIL "bob" "example.com") ("=?UTF-8?B?w4lsb2lzZQ==?=" NIL "eloise" "example.org") (NIL NIL "team" NIL) (NIL NIL NIL NIL)) (("Cara" NIL "cara" "example.com")) NIL NIL "<id@example.com>"))"#
+        let message = try XCTUnwrap(IMAPServerResponseParser.parseMessage(response, mailboxPath: "INBOX"))
+        XCTAssertEqual(message.toRecipients.map(\.email), ["bob@example.com", "eloise@example.org"])
+        XCTAssertEqual(message.toRecipients.map(\.display), ["Bob Smith <bob@example.com>", "Éloise <eloise@example.org>"])
+        XCTAssertEqual(message.ccRecipients.map(\.email), ["cara@example.com"])
+    }
+
+    func testPrintHeaderListsToAndCcRecipients() {
+        var message = MailMessage(id: 1, sender: "Alice", senderEmail: "alice@example.com", time: "Nov 6", subject: "Hi", preview: "", body: "x")
+        message.toRecipients = [MailAddress(name: "Bob", email: "bob@example.com")]
+        message.ccRecipients = [MailAddress(name: "", email: "cara@example.com")]
+        let out = MessagePrintDocument.html(for: message, mailboxName: nil)
+        XCTAssertTrue(out.contains("Bob &lt;bob@example.com&gt;"))
+        XCTAssertTrue(out.contains("<th>Cc:</th><td>cara@example.com</td>"))
+    }
+
+    func testCcIsWrittenToHeadersButBccNeverIs() {
+        let message = SMTPMessageBuilder.build(
+            from: "sender@example.com", fromName: "Sender",
+            recipients: ["to@example.com"], cc: ["cc@example.com", "cc2@example.com"],
+            subject: "Hi", body: OutgoingEmailBody(plainText: "x", html: "<p>x</p>")
+        )
+        XCTAssertTrue(message.contains("\r\nCc: <cc@example.com>, <cc2@example.com>\r\n"))
+        XCTAssertTrue(message.contains("\r\nTo: <to@example.com>\r\n"))
+        XCTAssertFalse(message.lowercased().contains("bcc"))
+    }
+
+    func testBccOnlyMessageUsesUndisclosedRecipientsHeader() {
+        let message = SMTPMessageBuilder.build(
+            from: "sender@example.com", fromName: "Sender", recipients: [],
+            subject: "Hi", body: OutgoingEmailBody(plainText: "x", html: "<p>x</p>")
+        )
+        XCTAssertTrue(message.contains("\r\nTo: undisclosed-recipients:;\r\n"))
+        XCTAssertFalse(message.contains("\r\nCc:"))
+    }
+
+    func testEnvelopeIncludesBccAndRemovesDuplicatesIgnoringCase() {
+        let envelope = SMTPMessageBuilder.envelopeRecipients(
+            to: ["a@example.com", "B@example.com"], cc: ["b@example.com", "c@example.com"], bcc: ["C@example.com", "d@example.com"]
+        )
+        XCTAssertEqual(envelope, ["a@example.com", "B@example.com", "c@example.com", "d@example.com"])
+    }
+
+    func testOptionalRecipientParsingAcceptsEmptyAndRejectsInvalid() {
+        XCTAssertEqual(GmailSMTPClient.parseOptionalRecipients("  "), [])
+        XCTAssertEqual(GmailSMTPClient.parseOptionalRecipients("a@example.com; b@example.com"), ["a@example.com", "b@example.com"])
+        XCTAssertNil(GmailSMTPClient.parseOptionalRecipients("a@example.com, nope"))
+    }
+
+    @MainActor
+    func testComposeRecipientCountsAcrossFieldsAndValidates() throws {
+        let store = MailStore(defaults: try XCTUnwrap(UserDefaults(suiteName: "cc-bcc-\(UUID().uuidString)")))
+        store.composeTo = ""
+        store.composeBcc = "hidden@example.com"
+        XCTAssertEqual(store.composeRecipientCount, 1)
+        store.composeCc = "hidden@example.com, other@example.com"
+        XCTAssertEqual(store.composeRecipientCount, 2)
+        store.composeCc = "broken"
+        XCTAssertNil(store.composeRecipients)
+        XCTAssertEqual(store.composeRecipientCount, 0)
+        store.clearComposeRecipients()
+        XCTAssertEqual(store.composeRecipientCount, 0)
+        XCTAssertFalse(store.composeShowsCcBcc)
+    }
+
+    func testEnvelopeParsesBccRecipientsWhenPresent() throws {
+        let response = #"* 10 FETCH (UID 78 FLAGS () INTERNALDATE "06-Nov-2026 15:30:00 +0000" ENVELOPE ("Fri, 6 Nov 2026 15:30:00 +0000" "Sent" (("Me" NIL "me" "example.com")) NIL NIL (("Bob" NIL "bob" "example.com")) NIL (("Hidden" NIL "hidden" "example.com")) NIL "<id2@example.com>"))"#
+        let message = try XCTUnwrap(IMAPServerResponseParser.parseMessage(response, mailboxPath: "[Gmail]/Sent Mail"))
+        XCTAssertEqual(message.bccRecipients.map(\.email), ["hidden@example.com"])
+        XCTAssertEqual(message.toRecipients.map(\.email), ["bob@example.com"])
+        XCTAssertTrue(message.ccRecipients.isEmpty)
     }
 }

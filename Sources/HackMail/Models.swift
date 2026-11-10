@@ -8,8 +8,12 @@ struct MailAccount: Identifiable, Codable, Equatable {
 
     init(email: String, fullName: String? = nil, signature: String = "") {
         self.email = email
-        self.fullName = fullName ?? ""
+        self.fullName = fullName ?? Self.suggestedFullName(for: email)
         self.signature = signature
+    }
+
+    static func suggestedFullName(for email: String) -> String {
+        PersonalDefaults.suggestedFullName(for: email)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -21,7 +25,7 @@ struct MailAccount: Identifiable, Codable, Equatable {
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         email = try values.decode(String.self, forKey: .email)
-        fullName = try values.decodeIfPresent(String.self, forKey: .fullName) ?? ""
+        fullName = try values.decodeIfPresent(String.self, forKey: .fullName) ?? Self.suggestedFullName(for: email)
         signature = try values.decodeIfPresent(String.self, forKey: .signature) ?? ""
     }
 
@@ -56,6 +60,16 @@ struct MailAttachment: Identifiable, Equatable, Sendable {
     var byteCount: Int { data.count }
 }
 
+struct MailAttachmentInfo: Identifiable, Equatable, Sendable {
+    let section: String
+    let fileName: String
+    let mimeType: String
+    let encodedSize: Int
+    let transferEncoding: String
+
+    var id: String { section }
+}
+
 struct MailMailbox: Identifiable, Equatable, Sendable {
     let path: String
     let name: String
@@ -81,6 +95,16 @@ struct MailMailbox: Identifiable, Equatable, Sendable {
     }
 }
 
+struct MailAddress: Equatable, Hashable, Sendable {
+    let name: String
+    let email: String
+
+    /// "Name <email>" when a display name exists, otherwise just the address.
+    var display: String {
+        name.isEmpty || name == email ? email : "\(name) <\(email)>"
+    }
+}
+
 struct MailMessage: Identifiable, Equatable, Sendable {
     let id: Int
     let sender: String
@@ -98,6 +122,12 @@ struct MailMessage: Identifiable, Equatable, Sendable {
     var flagged = false
     var isRemote = false
     var mailboxPath = "INBOX"
+    var attachments: [MailAttachmentInfo] = []
+    var toRecipients: [MailAddress] = []
+    var ccRecipients: [MailAddress] = []
+    var bccRecipients: [MailAddress] = []
+
+    var hasAttachments: Bool { !attachments.isEmpty }
 }
 
 enum MessageSortColumn: String, Sendable {

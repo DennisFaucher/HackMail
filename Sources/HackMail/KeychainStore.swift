@@ -3,7 +3,7 @@ import Security
 
 enum KeychainStore {
     // Keep the service stable across `swift run` and the packaged .app bundle.
-    private static let service = "com.hackmail.desktop"
+    private static let service = PersonalDefaults.keychainService
 
     static func loadPassword(for email: String) throws -> String? {
         let query: [String: Any] = [

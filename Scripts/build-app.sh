@@ -4,6 +4,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# The bundle identifier lives in Scripts/bundle-identifier.txt so this script is the same for every checkout.
+BUNDLE_ID="$(tr -d '[:space:]' < "$ROOT/Scripts/bundle-identifier.txt")"
+
 swift build --configuration release
 BIN_PATH="$(swift build --configuration release --show-bin-path)"
 APP_PATH="$ROOT/.build/HackMail.app"
@@ -14,7 +17,7 @@ cp "$ROOT/Icons/PirateMail.icns" "$APP_PATH/Contents/Resources/PirateMail.icns"
 rm -f "$APP_PATH/Contents/Resources/Assets.car" "$APP_PATH/Contents/Resources/AppIcon.icns"
 chmod +x "$APP_PATH/Contents/MacOS/HackMail"
 
-cat > "$APP_PATH/Contents/Info.plist" <<'PLIST'
+cat > "$APP_PATH/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -24,7 +27,7 @@ cat > "$APP_PATH/Contents/Info.plist" <<'PLIST'
     <key>CFBundleExecutable</key>
     <string>HackMail</string>
     <key>CFBundleIdentifier</key>
-    <string>com.hackmail.desktop</string>
+    <string>${BUNDLE_ID}</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
