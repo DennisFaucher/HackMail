@@ -10,6 +10,10 @@ final class MailStore: ObservableObject {
     @Published var selectedMessageID = -1
     /// The current serial stage of a mailbox load, shown while the list is loading.
     @Published var mailboxLoadProgress: MailboxLoadProgress?
+    /// The current serial stage of a message-body load, shown in the reader.
+    @Published var messageLoadProgress: MailboxLoadProgress?
+    /// When the current message-body load began, for an elapsed-time readout.
+    @Published var messageLoadStartedAt: Date?
     @Published var isPreparingPrint = false
     /// When the current mailbox load or search began, for an elapsed-time readout.
     @Published var loadStartedAt: Date?
@@ -44,6 +48,12 @@ final class MailStore: ObservableObject {
     @Published var quotedPlainText = ""
     @Published var composeAttachments: [MailAttachment] = []
     @Published var isSendingMessage = false
+    /// The current stage of an outgoing send, shown in the compose window.
+    @Published var sendProgressText: String?
+    /// When the current send began, for an elapsed-time readout.
+    @Published var sendStartedAt: Date?
+    /// Confirmation of the last successful send, shown in the main window until dismissed.
+    @Published var sendConfirmation: String?
     @Published var isPreparingCompose = false
     @Published var composePreparationMessage = ""
     @Published var composePreparationError: String?
@@ -260,30 +270,43 @@ final class MailStore: ObservableObject {
             throw MailComposerError.invalidSubject
         }
         isSendingMessage = true
-        defer { isSendingMessage = false }
-        let outgoingBody = try ComposeInlineImageProcessor.process(composeBody)
-        var plainText = outgoingBody.plainText
-        var html = outgoingBody.html
-        if let quotedMessage {
-            let isReply = composeTitle == "Reply"
-            let headerText: String
-            if isReply {
-                headerText = "On \(quotedMessage.time), \(quotedMessage.sender) wrote:"
-            } else {
-                headerText = "---------- Forwarded message ----------\nFrom: \(quotedMessage.sender) <\(quotedMessage.senderEmail)>\nDate: \(quotedMessage.time)\nSubject: \(quotedMessage.subject)"
-            }
-            let quotedHTML: String
-            if quotedMessage.bodyIsHTML {
-                quotedHTML = EmailHTMLSanitizer.bodyFragment(
-                    EmailHTMLSanitizer.forOutgoingMessage(quotedMessage.body, allowRemoteImages: quotedMessage.allowsRemoteImages)
-                )
-            } else {
-                quotedHTML = "<pre>\(EmailHTMLSanitizer.escapeText(quotedPlainText))</pre>"
-            }
-            plainText += "\n\n\(headerText)\n\(quotedPlainText)"
-            html += "<br><br><div>\(EmailHTMLSanitizer.escapeText(headerText))</div><blockquote style=\"border-left:2px solid #d4ccbd;margin-left:0;padding-left:14px\">\(quotedHTML)</blockquote>"
+        sendStartedAt = Date()
+        sendProgressText = "Preparing message…"
+        sendConfirmation = nil
+        defer {
+            isSendingMessage = false
+            sendProgressText = nil
+            sendStartedAt = nil
         }
-        let htmlDocument = "<!doctype html><html><body>\(html)</body></html>"
+        let outgoingBody = try ComposeInlineImageProcessor.process(composeBody)
+        let quote = quotedMessage
+        let quotePlainText = quotedPlainText
+        let isReply = composeTitle == "Reply"
+        // Sanitizing a large quoted HTML message parses the whole DOM, so do it off the main actor.
+        let (plainText, htmlDocument) = await Task.detached(priority: .userInitiated) {
+            var plainText = outgoingBody.plainText
+            var html = outgoingBody.html
+            if let quote {
+                let headerText: String
+                if isReply {
+                    headerText = "On \(quote.time), \(quote.sender) wrote:"
+                } else {
+                    headerText = "---------- Forwarded message ----------\nFrom: \(quote.sender) <\(quote.senderEmail)>\nDate: \(quote.time)\nSubject: \(quote.subject)"
+                }
+                let quotedHTML: String
+                if quote.bodyIsHTML {
+                    quotedHTML = EmailHTMLSanitizer.bodyFragment(
+                        EmailHTMLSanitizer.forOutgoingMessage(quote.body, allowRemoteImages: quote.allowsRemoteImages)
+                    )
+                } else {
+                    quotedHTML = "<pre>\(EmailHTMLSanitizer.escapeText(quotePlainText))</pre>"
+                }
+                plainText += "\n\n\(headerText)\n\(quotePlainText)"
+                html += "<br><br><div>\(EmailHTMLSanitizer.escapeText(headerText))</div><blockquote style=\"border-left:2px solid #d4ccbd;margin-left:0;padding-left:14px\">\(quotedHTML)</blockquote>"
+            }
+            return (plainText, "<!doctype html><html><body>\(html)</body></html>")
+        }.value
+        let recipientCount = SMTPMessageBuilder.envelopeRecipients(to: lists.to, cc: lists.cc, bcc: lists.bcc).count
         try await GmailSMTPClient().send(
             from: account.email,
             fromName: account.fullName,
@@ -293,8 +316,12 @@ final class MailStore: ObservableObject {
             bcc: lists.bcc,
             subject: composeSubject,
             body: OutgoingEmailBody(plainText: plainText, html: htmlDocument),
-            attachments: composeAttachments
+            attachments: composeAttachments,
+            progress: { [weak self] text in
+                Task { @MainActor in self?.sendProgressText = text }
+            }
         )
+        sendConfirmation = "Message sent to \(recipientCount) recipient\(recipientCount == 1 ? "" : "s")."
         clearComposeRecipients()
         composeSubject = ""
         composeAttachments = []
@@ -835,6 +862,8 @@ final class MailStore: ObservableObject {
         messageBodyLoadID = requestID
         loadingMessageID = message.id
         messageBodyBeforeLoad = message.body
+        messageLoadProgress = nil
+        messageLoadStartedAt = Date()
         markBodyLoading(message.id, loading: true, replaceWithPlaceholder: true)
         syncingAccount = account.email
         defer {
@@ -842,6 +871,8 @@ final class MailStore: ObservableObject {
                 messageBodyLoadTask = nil
                 loadingMessageID = nil
                 messageBodyBeforeLoad = nil
+                messageLoadProgress = nil
+                messageLoadStartedAt = nil
                 if syncingAccount == account.email { syncingAccount = nil }
             }
         }
@@ -851,7 +882,14 @@ final class MailStore: ObservableObject {
                     uid: message.id,
                     mailboxPath: message.mailboxPath,
                     email: account.email,
-                    password: password
+                    password: password,
+                    progress: { [weak self] step in
+                        Task { @MainActor in
+                            // Ignore a late report from a load that was cancelled or replaced.
+                            guard let self, self.messageBodyLoadID == requestID else { return }
+                            self.messageLoadProgress = step
+                        }
+                    }
                 )
             }
             messageBodyLoadTask = loadTask
@@ -893,6 +931,8 @@ final class MailStore: ObservableObject {
         messageBodyLoadTask = nil
         loadingMessageID = nil
         messageBodyBeforeLoad = nil
+        messageLoadProgress = nil
+        messageLoadStartedAt = nil
         if syncingAccount == accountEmail { syncingAccount = nil }
         messages = messages.map { item in
             guard item.id == messageID else { return item }
@@ -961,6 +1001,8 @@ final class MailStore: ObservableObject {
         messageBodyLoadID = requestID
         loadingMessageID = message.id
         messageBodyBeforeLoad = message.body
+        messageLoadProgress = nil
+        messageLoadStartedAt = Date()
         markBodyLoading(message.id, loading: true, replaceWithPlaceholder: false)
         syncingAccount = account.email
         defer {
@@ -968,6 +1010,8 @@ final class MailStore: ObservableObject {
                 messageBodyLoadTask = nil
                 loadingMessageID = nil
                 messageBodyBeforeLoad = nil
+                messageLoadProgress = nil
+                messageLoadStartedAt = nil
                 if syncingAccount == account.email { syncingAccount = nil }
             }
         }
@@ -978,7 +1022,13 @@ final class MailStore: ObservableObject {
                     mailboxPath: message.mailboxPath,
                     email: account.email,
                     password: password,
-                    full: true
+                    full: true,
+                    progress: { [weak self] step in
+                        Task { @MainActor in
+                            guard let self, self.messageBodyLoadID == requestID else { return }
+                            self.messageLoadProgress = step
+                        }
+                    }
                 )
             }
             messageBodyLoadTask = loadTask

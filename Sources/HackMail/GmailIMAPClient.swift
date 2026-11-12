@@ -119,8 +119,17 @@ struct GmailIMAPClient {
         }
     }
 
-    func fetchBody(uid: Int, mailboxPath: String, email: String, password: String, full: Bool = false, preferHTML: Bool = true) async throws -> FetchedMessageBody {
-        try await withSession(email: email, password: password) { session in
+    func fetchBody(
+        uid: Int,
+        mailboxPath: String,
+        email: String,
+        password: String,
+        full: Bool = false,
+        preferHTML: Bool = true,
+        progress: (@Sendable (MailboxLoadProgress) -> Void)? = nil
+    ) async throws -> FetchedMessageBody {
+        try await withSession(email: email, password: password, progress: progress) { session in
+            await session.report(.bodyOpeningFolder)
             try await session.selectMailbox(path: mailboxPath)
             return try await session.fetchBody(uid: uid, full: full, preferHTML: preferHTML)
         }
@@ -281,6 +290,12 @@ struct MailboxLoadProgress: Sendable, Equatable {
     static let searchOpeningFolder = MailboxLoadProgress(step: 3, text: "Opening the folder…")
     static let searching = MailboxLoadProgress(step: 4, text: "Gmail is searching this folder (large folders can take a while)…")
     static let searchFetchingHeaders = MailboxLoadProgress(step: 5, text: "Fetching the first matching messages…")
+
+    // Opening a single message runs the same six stages: connect, sign in, open folder, read, fetch, sign out.
+    static let bodyOpeningFolder = MailboxLoadProgress(step: 3, text: "Opening the folder…")
+    static let bodyReadingStructure = MailboxLoadProgress(step: 4, text: "Reading the message structure…")
+    static let bodyFetching = MailboxLoadProgress(step: 5, text: "Fetching the message text…")
+    static let bodyFetchingImages = MailboxLoadProgress(step: 5, text: "Fetching inline images…")
 
     let step: Int
     let text: String
@@ -585,6 +600,7 @@ private actor IMAPSession {
     func fetchBody(uid: Int, full: Bool, preferHTML: Bool) async throws -> FetchedMessageBody {
         // Resolve MIME metadata first, then fetch only the selected text part and CID images.
         // Regular attachment bytes are fetched only after an explicit user save action.
+        report(.bodyReadingStructure)
         let structureResponse = try await command("UID FETCH \(uid) (BODYSTRUCTURE)")
         guard let structure = Self.parseBodyStructure(structureResponse.lines),
               let bodyPart = Self.preferredTextPart(in: structure, preferHTML: preferHTML) else {
@@ -593,6 +609,7 @@ private actor IMAPSession {
         let attachments = IMAPAttachmentParser.parse(structureResponse.lines)
         let section = bodyPart.section.isEmpty ? "TEXT" : bodyPart.section
         let bodySection = full ? "BODY.PEEK[\(section)]" : "BODY.PEEK[\(section)]<0.65536>"
+        report(.bodyFetching)
         let response = try await command("UID FETCH \(uid) (\(bodySection))")
         guard let literal = response.segments.compactMap({ segment -> Data? in
             guard case .literal(let data) = segment else { return nil }
@@ -615,6 +632,7 @@ private actor IMAPSession {
                 attachments: attachments
             )
         }
+        report(.bodyFetchingImages)
         let inlineImages = try await fetchInlineImages(uid: uid, parts: bodyPart.inlineImages)
         let html = IMAPInlineImageResolver.replacingCIDReferences(in: fetchedBody.content, with: inlineImages)
         return FetchedMessageBody(content: html, isHTML: true, isPartial: fetchedBody.isPartial, attachments: attachments)
@@ -1244,9 +1262,9 @@ enum IMAPServerResponseParser {
         if calendar.isDateInToday(date) {
             formatter.dateFormat = "h:mm a"
         } else if calendar.isDateInYesterday(date) {
-            return "Yesterday"
+            formatter.dateFormat = "'Yesterday,' h:mm a"
         } else {
-            formatter.dateFormat = "MMM d"
+            formatter.dateFormat = "MMM d, h:mm a"
         }
         return formatter.string(from: date)
     }

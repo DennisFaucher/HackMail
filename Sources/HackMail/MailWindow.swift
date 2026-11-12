@@ -21,7 +21,7 @@ private let mailTableColumns: [GridItem] = [
     GridItem(.fixed(28), alignment: .center),
     GridItem(.flexible(minimum: 180, maximum: 400), alignment: .leading),
     GridItem(.flexible(minimum: 140), alignment: .leading),
-    GridItem(.fixed(84), alignment: .trailing)
+    GridItem(.fixed(124), alignment: .trailing)
 ]
 
 struct MailWindow: View {
@@ -48,6 +48,22 @@ struct MailWindow: View {
         .foregroundStyle(Paper.ink)
         .sheet(isPresented: $store.showSettings) { AccountSettingsView().environmentObject(store) }
         .sheet(isPresented: $store.isComposing) { ComposeView() }
+        .overlay(alignment: .bottom) {
+            if let confirmation = store.sendConfirmation {
+                Label(confirmation, systemImage: "paperplane.fill")
+                    .font(.system(size: 12.5, weight: .medium)).foregroundStyle(.white)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(Paper.accent, in: Capsule())
+                    .padding(.bottom, 16)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .task(id: confirmation) {
+                        try? await Task.sleep(for: .seconds(5))
+                        store.sendConfirmation = nil
+                    }
+                    .accessibilityAddTraits(.updatesFrequently)
+            }
+        }
+        .animation(.default, value: store.sendConfirmation)
         .alert("Gmail", isPresented: Binding(
             get: { store.activeError != nil },
             set: { if !$0 { store.activeError = nil } }
@@ -634,7 +650,16 @@ private struct MessageReader: View {
                     if store.loadingMessageID == message.id {
                         HStack(spacing: 10) {
                             ProgressView().controlSize(.small)
-                            Text("Loading message from Gmail…").font(.system(size: 12)).foregroundStyle(Paper.secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(store.messageLoadProgress?.displayText ?? "Loading message from Gmail…")
+                                    .font(.system(size: 12)).foregroundStyle(Paper.secondary)
+                                if let started = store.messageLoadStartedAt {
+                                    TimelineView(.periodic(from: started, by: 1)) { context in
+                                        Text("\(max(0, Int(context.date.timeIntervalSince(started)))) s elapsed")
+                                            .font(.system(size: 11)).foregroundStyle(Paper.secondary).monospacedDigit()
+                                    }
+                                }
+                            }
                             Spacer()
                             Button("Cancel (Esc)") { store.cancelCurrentMessageLoad() }
                                 .buttonStyle(.bordered).controlSize(.small)
@@ -1019,7 +1044,18 @@ private struct ComposeView: View {
                     Text("Add an app password in Settings to send mail.").font(.system(size: 11.5)).foregroundStyle(Paper.secondary)
                 }
                 Spacer(minLength: 8)
-                if store.isSendingMessage { ProgressView().controlSize(.small) }
+                if store.isSendingMessage {
+                    ProgressView().controlSize(.small)
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text(store.sendProgressText ?? "Sending…").font(.system(size: 11.5)).foregroundStyle(Paper.secondary)
+                        if let started = store.sendStartedAt {
+                            TimelineView(.periodic(from: started, by: 1)) { context in
+                                Text("\(max(0, Int(context.date.timeIntervalSince(started)))) s elapsed")
+                                    .font(.system(size: 11)).foregroundStyle(Paper.secondary).monospacedDigit()
+                            }
+                        }
+                    }
+                }
                 Button("Send") { send() }
                     .buttonStyle(.borderedProminent).tint(Paper.accent)
                     .keyboardShortcut(.return, modifiers: .command)

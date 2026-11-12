@@ -24,7 +24,7 @@ struct GmailSMTPClient: Sendable {
         return email.range(of: pattern, options: .regularExpression) != nil
     }
 
-    func send(from: String, fromName: String, password: String, to recipients: [String], cc: [String] = [], bcc: [String] = [], subject: String, body: OutgoingEmailBody, attachments: [MailAttachment]) async throws {
+    func send(from: String, fromName: String, password: String, to recipients: [String], cc: [String] = [], bcc: [String] = [], subject: String, body: OutgoingEmailBody, attachments: [MailAttachment], progress: (@Sendable (String) -> Void)? = nil) async throws {
         let envelope = SMTPMessageBuilder.envelopeRecipients(to: recipients, cc: cc, bcc: bcc)
         guard envelope.count <= Self.maximumRecipients else { throw SMTPError.tooManyRecipients }
         guard Self.isValidEmail(from), !envelope.isEmpty, envelope.allSatisfy(Self.isValidEmail),
@@ -34,9 +34,11 @@ struct GmailSMTPClient: Sendable {
         }
         let session = SMTPSession()
         do {
+            progress?("Connecting to Gmail…")
             try await session.open()
+            progress?("Signing in…")
             try await session.authenticate(email: from, password: password)
-            try await session.sendMessage(from: from, fromName: fromName, recipients: recipients, cc: cc, envelope: envelope, subject: subject, body: body, attachments: attachments)
+            try await session.sendMessage(from: from, fromName: fromName, recipients: recipients, cc: cc, envelope: envelope, subject: subject, body: body, attachments: attachments, progress: progress)
             // A final 250 response means Gmail accepted the message. QUIT failure after that
             // must not make the UI suggest retrying, which could send a duplicate.
             try? await session.quit()
@@ -308,7 +310,8 @@ private actor SMTPSession {
         }
     }
 
-    func sendMessage(from: String, fromName: String, recipients: [String], cc: [String], envelope: [String], subject: String, body: OutgoingEmailBody, attachments: [MailAttachment]) async throws {
+    func sendMessage(from: String, fromName: String, recipients: [String], cc: [String], envelope: [String], subject: String, body: OutgoingEmailBody, attachments: [MailAttachment], progress: (@Sendable (String) -> Void)? = nil) async throws {
+        progress?("Addressing message to \(envelope.count) recipient\(envelope.count == 1 ? "" : "s")…")
         let senderResponse = try await command("MAIL FROM:<\(from)>")
         try require(senderResponse, codes: [250])
         for recipient in envelope {
@@ -318,9 +321,12 @@ private actor SMTPSession {
         let dataResponse = try await command("DATA")
         try require(dataResponse, codes: [354])
 
+        progress?("Encoding message and attachments…")
         let payload = SMTPMessageBuilder.build(from: from, fromName: fromName, recipients: recipients, cc: cc, subject: subject, body: body, attachments: attachments)
         do {
+            progress?("Uploading message to Gmail…")
             try await send(payload + ".\r\n")
+            progress?("Waiting for Gmail to accept the message…")
             receiveTimeout = Self.acceptanceTimeout
             defer { receiveTimeout = Self.defaultReceiveTimeout }
             let accepted = try await readReply()
