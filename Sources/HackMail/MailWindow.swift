@@ -438,6 +438,11 @@ private struct MailToolbar: View {
                         help: store.selectedMessagesAreAllFlagged ? "Unflag Selected Messages" : "Flag Selected Messages"
                     ) { store.toggleFlagSelectedMessages() }
                         .disabled(!canApplyBulkAction)
+                    toolbarButton(
+                        store.selectedMailbox?.isSpam == true ? "checkmark.shield" : "exclamationmark.octagon",
+                        help: store.selectedMailbox?.isSpam == true ? "Not Spam: Move Selected to Inbox" : "Mark Selected as Spam"
+                    ) { store.toggleSpamSelectedMessages() }
+                        .disabled(!canApplyBulkAction || !store.canToggleSpam)
                     toolbarButton("trash", help: store.selectedMailbox?.isTrash == true ? "Permanently Delete Selected" : "Move Selected to Trash") {
                         store.deleteSelectedMessages()
                     }
@@ -446,6 +451,11 @@ private struct MailToolbar: View {
                 }
             } else {
                 moveMailboxButton
+                toolbarButton(
+                    store.selectedMailbox?.isSpam == true ? "checkmark.shield" : "exclamationmark.octagon",
+                    help: store.selectedMailbox?.isSpam == true ? "Not Spam: Move to Inbox" : "Mark as Spam"
+                ) { store.toggleSpamSelected() }
+                    .disabled(store.selectedMessage?.isRemote != true || store.syncingAccount != nil || !store.canToggleSpam)
                 toolbarButton("trash", help: store.selectedMailbox?.isTrash == true ? "Delete Permanently" : "Move to Trash") { store.deleteSelected() }
                     .disabled(store.selectedMessage?.isRemote != true || store.syncingAccount != nil)
                 Rectangle().fill(Paper.border).frame(width: 1, height: 18).padding(.horizontal, 5)

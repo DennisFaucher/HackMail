@@ -15,7 +15,7 @@ Run the automated checks with `swift test`.
 No message is selected when you open a folder or finish a search; nothing loads until you click a message.
 In the message list, click a row or mailbox to focus the list, then use **↑ / ↓** to move through
 messages and update the reader. **Command-click** adds or removes messages from a selection;
-**Shift-click** selects a range. Bulk toolbar actions move, flag/unflag, or delete selected messages.
+**Shift-click** selects a range. Bulk toolbar actions move, flag/unflag, mark as spam (or "Not Spam" inside the Spam folder), or delete selected messages.
 
 Build and launch a local app bundle:
 

@@ -77,6 +77,7 @@ struct MailMailbox: Identifiable, Equatable, Sendable {
 
     var id: String { path }
     var isInbox: Bool { hasAttribute("\\Inbox") || path.caseInsensitiveCompare("INBOX") == .orderedSame }
+    var isSpam: Bool { hasAttribute("\\Junk") || name.caseInsensitiveCompare("Spam") == .orderedSame }
     var isTrash: Bool { hasAttribute("\\Trash") || name.caseInsensitiveCompare("Trash") == .orderedSame }
 
     var symbol: String {

@@ -1321,6 +1321,29 @@ final class MailStore: ObservableObject {
         Task { await performRemoteAction(.move(mailbox.path), message: message, accountEmail: accountEmail) }
     }
 
+    /// The destination for the spam toggle: Spam from anywhere else, Inbox when already in Spam.
+    private var spamToggleDestination: (path: String, isSpam: Bool)? {
+        if selectedMailbox?.isSpam == true {
+            guard let inbox = mailboxes.first(where: { $0.isInbox }) else { return nil }
+            return (inbox.path, false)
+        }
+        guard let spam = mailboxes.first(where: { $0.isSpam }) else { return nil }
+        return (spam.path, true)
+    }
+
+    var canToggleSpam: Bool { spamToggleDestination != nil }
+
+    func toggleSpamSelected() {
+        guard let message = selectedMessage, message.isRemote, let target = spamToggleDestination else { return }
+        let accountEmail = selectedAccount
+        Task { await performRemoteAction(.spam(destination: target.path, isSpam: target.isSpam), message: message, accountEmail: accountEmail) }
+    }
+
+    func toggleSpamSelectedMessages() {
+        guard isMultiSelectionActive, let target = spamToggleDestination else { return }
+        Task { await performBulkRemoteAction(.spam(destination: target.path, isSpam: target.isSpam), messages: selectedMessages) }
+    }
+
     func deleteSelected() {
         guard let message = selectedMessage, message.isRemote else { return }
         let currentMailboxIsTrash = selectedMailbox?.isTrash ?? false
@@ -1386,6 +1409,7 @@ final class MailStore: ObservableObject {
         case archive
         case star(Bool)
         case move(String)
+        case spam(destination: String, isSpam: Bool)
         case delete(isTrash: Bool, trashPath: String?)
     }
 
@@ -1393,6 +1417,7 @@ final class MailStore: ObservableObject {
         case archive
         case star(Bool)
         case move(String)
+        case spam(destination: String, isSpam: Bool)
         case delete(isTrash: Bool, trashPath: String?)
     }
 
@@ -1417,7 +1442,7 @@ final class MailStore: ObservableObject {
                 try await client.archive(uids: uids, mailboxPath: sourceMailbox, email: account.email, password: password)
             case .star(let shouldStar):
                 try await client.setStarred(uids: uids, mailboxPath: sourceMailbox, starred: shouldStar, email: account.email, password: password)
-            case .move(let destination):
+            case .move(let destination), .spam(let destination, _):
                 try await client.move(uids: uids, from: sourceMailbox, to: destination, email: account.email, password: password)
             case .delete(let isTrash, let trashPath):
                 try await client.delete(uids: uids, mailboxPath: sourceMailbox, isTrash: isTrash, trashPath: trashPath, email: account.email, password: password)
@@ -1440,6 +1465,11 @@ final class MailStore: ObservableObject {
             case .move:
                 shouldRemoveFromCurrentMailbox = true
                 status = "Connected · \(messagesToActOn.count) messages moved"
+            case .spam(_, let isSpam):
+                shouldRemoveFromCurrentMailbox = true
+                status = isSpam
+                    ? "Connected · \(messagesToActOn.count) messages marked as spam"
+                    : "Connected · \(messagesToActOn.count) messages moved to Inbox (not spam)"
             case .delete(let isTrash, _):
                 shouldRemoveFromCurrentMailbox = true
                 status = isTrash
@@ -1499,6 +1529,10 @@ final class MailStore: ObservableObject {
                 try await client.move(uid: message.id, from: message.mailboxPath, to: destination, email: account.email, password: password)
                 removeFromCurrentMailbox(message.id, account: account)
                 accountStatuses[account.email] = "Connected · Message moved"
+            case .spam(let destination, let isSpam):
+                try await client.move(uid: message.id, from: message.mailboxPath, to: destination, email: account.email, password: password)
+                removeFromCurrentMailbox(message.id, account: account)
+                accountStatuses[account.email] = isSpam ? "Connected · Message marked as spam" : "Connected · Message moved to Inbox (not spam)"
             case .delete(let isTrash, let trashPath):
                 try await client.delete(uid: message.id, mailboxPath: message.mailboxPath, isTrash: isTrash, trashPath: trashPath, email: account.email, password: password)
                 removeFromCurrentMailbox(message.id, account: account)

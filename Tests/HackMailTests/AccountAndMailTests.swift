@@ -694,4 +694,10 @@ final class MailStoreNavigationTests: XCTestCase {
         XCTAssertEqual(message.toRecipients.map(\.email), ["bob@example.com"])
         XCTAssertTrue(message.ccRecipients.isEmpty)
     }
+
+    func testSpamMailboxDetectedByJunkAttributeOrName() {
+        XCTAssertTrue(MailMailbox(path: "[Gmail]/Spam", name: "Spam", attributes: ["\\Junk"]).isSpam)
+        XCTAssertTrue(MailMailbox(path: "Junk", name: "Spam", attributes: []).isSpam)
+        XCTAssertFalse(MailMailbox(path: "INBOX", name: "Inbox", attributes: ["\\Inbox"]).isSpam)
+    }
 }
