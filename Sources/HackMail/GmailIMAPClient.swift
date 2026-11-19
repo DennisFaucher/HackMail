@@ -156,11 +156,8 @@ struct GmailIMAPClient {
         }
     }
 
-    func archive(uid: Int, mailboxPath: String, email: String, password: String) async throws {
-        try await withSession(email: email, password: password) { session in
-            try await session.selectMailbox(path: mailboxPath)
-            try await session.archive(uid: uid)
-        }
+    func archive(uid: Int, mailboxPath: String, email: String, password: String, label: String = "Archiving the message…", progress: (@Sendable (MailboxLoadProgress) -> Void)? = nil) async throws {
+        try await archive(uids: [uid], mailboxPath: mailboxPath, email: email, password: password, label: label, progress: progress)
     }
 
     func setStarred(uid: Int, mailboxPath: String, starred: Bool, email: String, password: String) async throws {
@@ -185,38 +182,31 @@ struct GmailIMAPClient {
         }
     }
 
-    func move(uid: Int, from mailboxPath: String, to destination: String, email: String, password: String) async throws {
-        try await withSession(email: email, password: password) { session in
-            try await session.selectMailbox(path: mailboxPath)
-            try await session.move(uid: uid, to: destination)
-        }
+    func move(uid: Int, from mailboxPath: String, to destination: String, email: String, password: String, label: String = "Moving the message…", progress: (@Sendable (MailboxLoadProgress) -> Void)? = nil) async throws {
+        try await move(uids: [uid], from: mailboxPath, to: destination, email: email, password: password, label: label, progress: progress)
     }
 
-    func move(uids: [Int], from mailboxPath: String, to destination: String, email: String, password: String) async throws {
+    func move(uids: [Int], from mailboxPath: String, to destination: String, email: String, password: String, label: String = "Moving messages…", progress: (@Sendable (MailboxLoadProgress) -> Void)? = nil) async throws {
         guard !uids.isEmpty else { return }
-        try await withSession(email: email, password: password) { session in
+        try await withSession(email: email, password: password, progress: progress) { session in
+            await session.report(.actionOpeningFolder)
             try await session.selectMailbox(path: mailboxPath)
+            await session.report(.actionApplying(label))
             try await session.move(uids: uids, to: destination)
+            await session.report(.actionConfirming)
         }
     }
 
-    func delete(uid: Int, mailboxPath: String, isTrash: Bool, trashPath: String?, email: String, password: String) async throws {
-        try await withSession(email: email, password: password) { session in
-            try await session.selectMailbox(path: mailboxPath)
-            if isTrash {
-                try await session.permanentlyDelete(uid: uid)
-            } else if let trashPath {
-                try await session.move(uid: uid, to: trashPath)
-            } else {
-                throw IMAPError.protocolError("Gmail did not provide a Trash mailbox.")
-            }
-        }
+    func delete(uid: Int, mailboxPath: String, isTrash: Bool, trashPath: String?, email: String, password: String, label: String = "Deleting the message…", progress: (@Sendable (MailboxLoadProgress) -> Void)? = nil) async throws {
+        try await delete(uids: [uid], mailboxPath: mailboxPath, isTrash: isTrash, trashPath: trashPath, email: email, password: password, label: label, progress: progress)
     }
 
-    func delete(uids: [Int], mailboxPath: String, isTrash: Bool, trashPath: String?, email: String, password: String) async throws {
+    func delete(uids: [Int], mailboxPath: String, isTrash: Bool, trashPath: String?, email: String, password: String, label: String = "Deleting messages…", progress: (@Sendable (MailboxLoadProgress) -> Void)? = nil) async throws {
         guard !uids.isEmpty else { return }
-        try await withSession(email: email, password: password) { session in
+        try await withSession(email: email, password: password, progress: progress) { session in
+            await session.report(.actionOpeningFolder)
             try await session.selectMailbox(path: mailboxPath)
+            await session.report(.actionApplying(label))
             if isTrash {
                 try await session.permanentlyDelete(uids: uids)
             } else if let trashPath {
@@ -224,14 +214,18 @@ struct GmailIMAPClient {
             } else {
                 throw IMAPError.protocolError("Gmail did not provide a Trash mailbox.")
             }
+            await session.report(.actionConfirming)
         }
     }
 
-    func archive(uids: [Int], mailboxPath: String, email: String, password: String) async throws {
+    func archive(uids: [Int], mailboxPath: String, email: String, password: String, label: String = "Archiving messages…", progress: (@Sendable (MailboxLoadProgress) -> Void)? = nil) async throws {
         guard !uids.isEmpty else { return }
-        try await withSession(email: email, password: password) { session in
+        try await withSession(email: email, password: password, progress: progress) { session in
+            await session.report(.actionOpeningFolder)
             try await session.selectMailbox(path: mailboxPath)
+            await session.report(.actionApplying(label))
             try await session.archive(uids: uids)
+            await session.report(.actionConfirming)
         }
     }
 
@@ -296,6 +290,11 @@ struct MailboxLoadProgress: Sendable, Equatable {
     static let bodyReadingStructure = MailboxLoadProgress(step: 4, text: "Reading the message structure…")
     static let bodyFetching = MailboxLoadProgress(step: 5, text: "Fetching the message text…")
     static let bodyFetchingImages = MailboxLoadProgress(step: 5, text: "Fetching inline images…")
+
+    // A move, delete, or archive runs the same six stages: connect, sign in, open folder, apply the change, wait, sign out.
+    static let actionOpeningFolder = MailboxLoadProgress(step: 3, text: "Opening the folder…")
+    static func actionApplying(_ label: String) -> MailboxLoadProgress { MailboxLoadProgress(step: 4, text: label) }
+    static let actionConfirming = MailboxLoadProgress(step: 5, text: "Waiting for Gmail to confirm…")
 
     let step: Int
     let text: String

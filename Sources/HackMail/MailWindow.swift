@@ -207,6 +207,25 @@ struct MailWindow: View {
             }
         }
         .scrollIndicators(.hidden)
+        .overlay(alignment: .bottom) {
+            if let progress = store.actionProgress {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(progress.displayText).lineLimit(1)
+                    if let started = store.actionStartedAt {
+                        TimelineView(.periodic(from: started, by: 1)) { context in
+                            Text("\(max(0, Int(context.date.timeIntervalSince(started)))) s").monospacedDigit()
+                        }
+                    }
+                }
+                .font(.system(size: 11.5)).foregroundStyle(Paper.ink)
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background(Paper.panel, in: Capsule())
+                .overlay(Capsule().stroke(Paper.border, lineWidth: 1))
+                .padding(.bottom, 8)
+                .accessibilityElement(children: .combine)
+            }
+        }
         .frame(height: 290)
         .background(Paper.panel)
         .clipShape(RoundedRectangle(cornerRadius: 12))

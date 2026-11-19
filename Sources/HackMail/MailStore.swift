@@ -48,6 +48,10 @@ final class MailStore: ObservableObject {
     @Published var quotedPlainText = ""
     @Published var composeAttachments: [MailAttachment] = []
     @Published var isSendingMessage = false
+    /// The current serial stage of a move, delete, spam, or archive, shown over the message list.
+    @Published var actionProgress: MailboxLoadProgress?
+    /// When the current remote action began, for an elapsed-time readout.
+    @Published var actionStartedAt: Date?
     /// The current stage of an outgoing send, shown in the compose window.
     @Published var sendProgressText: String?
     /// When the current send began, for an elapsed-time readout.
@@ -679,13 +683,28 @@ final class MailStore: ObservableObject {
                 }
             )
             let previousSelection = selectedMessageID
+            // A refresh (including one triggered by IMAP IDLE) must not re-fetch a body that is already
+            // showing: carry the loaded body over so the reader does not blank and the app does not lock.
+            let loadedSelection = messages.first {
+                $0.id == previousSelection && $0.mailboxPath == requestedPath && !$0.body.isEmpty && !$0.bodyIsLoading
+            }
             mailboxes = snapshot.mailboxes
-            messages = snapshot.messages
+            messages = snapshot.messages.map { item in
+                guard let loaded = loadedSelection, item.id == loaded.id, item.mailboxPath == loaded.mailboxPath,
+                      item.body.isEmpty else { return item }
+                var kept = item
+                kept.body = loaded.body
+                kept.bodyIsHTML = loaded.bodyIsHTML
+                kept.bodyIsPartial = loaded.bodyIsPartial
+                kept.allowsRemoteImages = loaded.allowsRemoteImages
+                kept.attachments = loaded.attachments
+                return kept
+            }
             // Keep the user's selection across a refresh if that message is still listed; never pick one for them.
             selectedMessageID = snapshot.messages.first(where: { $0.id == previousSelection })?.id ?? -1
             selectedAccount = account.email
             accountStatuses[account.email] = "Connected · \(selectedMailbox?.name ?? "mailbox") loaded"
-            if let selected = snapshot.messages.first(where: { $0.id == selectedMessageID }) {
+            if let selected = messages.first(where: { $0.id == selectedMessageID }), selected.body.isEmpty {
                 await loadBody(for: selected, accountEmail: account.email)
             }
         } catch {
@@ -1405,6 +1424,37 @@ final class MailStore: ObservableObject {
         pendingMultiPermanentDelete = nil
     }
 
+    private func actionLabel(for action: RemoteAction, count: Int) -> String {
+        let noun = count == 1 ? "the message" : "\(count) messages"
+        switch action {
+        case .archive: return "Archiving \(noun)…"
+        case .star: return "Updating \(noun)…"
+        case .move: return "Moving \(noun)…"
+        case .spam(_, let isSpam): return isSpam ? "Marking \(noun) as spam…" : "Moving \(noun) back to the Inbox…"
+        case .delete(let isTrash, _): return isTrash ? "Permanently deleting \(noun)…" : "Moving \(noun) to Trash…"
+        }
+    }
+
+    private func beginActionProgress() {
+        actionProgress = .connecting
+        actionStartedAt = Date()
+    }
+
+    private func endActionProgress() {
+        actionProgress = nil
+        actionStartedAt = nil
+    }
+
+    private var actionProgressHandler: @Sendable (MailboxLoadProgress) -> Void {
+        { [weak self] step in
+            Task { @MainActor in
+                // Ignore a late report that arrives after the action has finished.
+                guard let self, self.actionStartedAt != nil else { return }
+                self.actionProgress = step
+            }
+        }
+    }
+
     private enum RemoteAction {
         case archive
         case star(Bool)
@@ -1419,6 +1469,16 @@ final class MailStore: ObservableObject {
         case move(String)
         case spam(destination: String, isSpam: Bool)
         case delete(isTrash: Bool, trashPath: String?)
+
+        var asSingle: RemoteAction {
+            switch self {
+            case .archive: .archive
+            case .star(let value): .star(value)
+            case .move(let path): .move(path)
+            case .spam(let destination, let isSpam): .spam(destination: destination, isSpam: isSpam)
+            case .delete(let isTrash, let trashPath): .delete(isTrash: isTrash, trashPath: trashPath)
+            }
+        }
     }
 
     private func performBulkRemoteAction(_ action: BulkRemoteAction, messages messagesToActOn: [MailMessage]) async {
@@ -1433,19 +1493,25 @@ final class MailStore: ObservableObject {
         syncingAccount = account.email
         accountErrors[account.email] = nil
         activeError = nil
-        defer { syncingAccount = nil }
+        let label = actionLabel(for: action.asSingle, count: uids.count)
+        let progress = actionProgressHandler
+        if case .star = action {} else { beginActionProgress() }
+        defer {
+            syncingAccount = nil
+            endActionProgress()
+        }
 
         do {
             let client = GmailIMAPClient()
             switch action {
             case .archive:
-                try await client.archive(uids: uids, mailboxPath: sourceMailbox, email: account.email, password: password)
+                try await client.archive(uids: uids, mailboxPath: sourceMailbox, email: account.email, password: password, label: label, progress: progress)
             case .star(let shouldStar):
                 try await client.setStarred(uids: uids, mailboxPath: sourceMailbox, starred: shouldStar, email: account.email, password: password)
             case .move(let destination), .spam(let destination, _):
-                try await client.move(uids: uids, from: sourceMailbox, to: destination, email: account.email, password: password)
+                try await client.move(uids: uids, from: sourceMailbox, to: destination, email: account.email, password: password, label: label, progress: progress)
             case .delete(let isTrash, let trashPath):
-                try await client.delete(uids: uids, mailboxPath: sourceMailbox, isTrash: isTrash, trashPath: trashPath, email: account.email, password: password)
+                try await client.delete(uids: uids, mailboxPath: sourceMailbox, isTrash: isTrash, trashPath: trashPath, email: account.email, password: password, label: label, progress: progress)
             }
 
             guard selectedAccount == account.email, selectedMailboxPath == sourceMailbox else { return }
@@ -1500,12 +1566,18 @@ final class MailStore: ObservableObject {
         syncingAccount = account.email
         accountErrors[account.email] = nil
         activeError = nil
-        defer { syncingAccount = nil }
+        let label = actionLabel(for: action, count: 1)
+        let progress = actionProgressHandler
+        if case .star = action {} else { beginActionProgress() }
+        defer {
+            syncingAccount = nil
+            endActionProgress()
+        }
         let client = GmailIMAPClient()
         do {
             switch action {
             case .archive:
-                try await client.archive(uid: message.id, mailboxPath: message.mailboxPath, email: account.email, password: password)
+                try await client.archive(uid: message.id, mailboxPath: message.mailboxPath, email: account.email, password: password, label: label, progress: progress)
                 if selectedMailbox?.isInbox == true {
                     removeFromCurrentMailbox(message.id, account: account)
                 }
@@ -1526,15 +1598,15 @@ final class MailStore: ObservableObject {
                 }
                 accountStatuses[account.email] = "Connected · Star updated"
             case .move(let destination):
-                try await client.move(uid: message.id, from: message.mailboxPath, to: destination, email: account.email, password: password)
+                try await client.move(uid: message.id, from: message.mailboxPath, to: destination, email: account.email, password: password, label: label, progress: progress)
                 removeFromCurrentMailbox(message.id, account: account)
                 accountStatuses[account.email] = "Connected · Message moved"
             case .spam(let destination, let isSpam):
-                try await client.move(uid: message.id, from: message.mailboxPath, to: destination, email: account.email, password: password)
+                try await client.move(uid: message.id, from: message.mailboxPath, to: destination, email: account.email, password: password, label: label, progress: progress)
                 removeFromCurrentMailbox(message.id, account: account)
                 accountStatuses[account.email] = isSpam ? "Connected · Message marked as spam" : "Connected · Message moved to Inbox (not spam)"
             case .delete(let isTrash, let trashPath):
-                try await client.delete(uid: message.id, mailboxPath: message.mailboxPath, isTrash: isTrash, trashPath: trashPath, email: account.email, password: password)
+                try await client.delete(uid: message.id, mailboxPath: message.mailboxPath, isTrash: isTrash, trashPath: trashPath, email: account.email, password: password, label: label, progress: progress)
                 removeFromCurrentMailbox(message.id, account: account)
                 accountStatuses[account.email] = isTrash ? "Connected · Message permanently deleted" : "Connected · Message moved to Trash"
             }
