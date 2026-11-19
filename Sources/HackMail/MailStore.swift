@@ -248,6 +248,30 @@ final class MailStore: ObservableObject {
         startPreparingQuote(for: message)
     }
 
+    func beginReplyAll() {
+        guard let message = selectedMessage, !message.senderEmail.isEmpty else { return }
+        // Never address the user's own accounts, and list each address once (ignoring case).
+        let ownAddresses = Set(accounts.map { $0.email.lowercased() })
+        var seen = ownAddresses
+        func uniqueOthers(_ addresses: [String]) -> [String] {
+            addresses.filter { !$0.isEmpty && seen.insert($0.lowercased()).inserted }
+        }
+        var toList = uniqueOthers([message.senderEmail] + message.toRecipients.map(\.email))
+        let ccList = uniqueOthers(message.ccRecipients.map(\.email))
+        // Replying to a message the user sent: there is no one else to address, so fall back to the sender.
+        if toList.isEmpty && ccList.isEmpty { toList = [message.senderEmail] }
+        composeTitle = "Reply All"
+        clearComposeRecipients()
+        composeTo = toList.joined(separator: ", ")
+        composeCc = ccList.joined(separator: ", ")
+        composeShowsCcBcc = !ccList.isEmpty
+        composeSubject = message.subject.lowercased().hasPrefix("re:") ? message.subject : "Re: \(message.subject)"
+        composeAttachments = []
+        quotedMessage = nil
+        quotedPlainText = ""
+        startPreparingQuote(for: message)
+    }
+
     func beginForward() {
         guard let message = selectedMessage else { return }
         composeTitle = "Forward"
@@ -285,7 +309,7 @@ final class MailStore: ObservableObject {
         let outgoingBody = try ComposeInlineImageProcessor.process(composeBody)
         let quote = quotedMessage
         let quotePlainText = quotedPlainText
-        let isReply = composeTitle == "Reply"
+        let isReply = composeTitle != "Forward"
         // Sanitizing a large quoted HTML message parses the whole DOM, so do it off the main actor.
         let (plainText, htmlDocument) = await Task.detached(priority: .userInitiated) {
             var plainText = outgoingBody.plainText

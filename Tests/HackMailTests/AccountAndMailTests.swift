@@ -700,4 +700,66 @@ final class MailStoreNavigationTests: XCTestCase {
         XCTAssertTrue(MailMailbox(path: "Junk", name: "Spam", attributes: []).isSpam)
         XCTAssertFalse(MailMailbox(path: "INBOX", name: "Inbox", attributes: ["\\Inbox"]).isSpam)
     }
+
+    func testAdjacentEncodedWordsDropSeparatingWhitespace() {
+        let subject = "=?UTF-8?Q?You=E2=80=99ve_reported_you_didn=E2=80=99t_rec?=\r\n =?UTF-8?Q?eive_your_item:?= Request 5390809693"
+        XCTAssertEqual(IMAPServerResponseParser.decodeHeader(subject), "You\u{2019}ve reported you didn\u{2019}t receive your item: Request 5390809693")
+    }
+
+    func testEncodedWordsDecodeCharacterSplitAcrossWords() {
+        XCTAssertEqual(IMAPServerResponseParser.decodeHeader("=?UTF-8?Q?it=E2=80?= =?UTF-8?Q?=99s?="), "it\u{2019}s")
+        XCTAssertEqual(IMAPServerResponseParser.decodeHeader("Re: =?UTF-8?Q?caf=C3=A9?= menu"), "Re: caf\u{00E9} menu")
+    }
+
+    @MainActor
+    func testReplyAllAddressesEveryoneExceptOwnAccountsWithoutDuplicates() throws {
+        let suiteName = "HackMailTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = MailStore(defaults: defaults)
+        store.accounts = [MailAccount(email: "me@example.test"), MailAccount(email: "other@example.test")]
+        store.selectedAccount = "me@example.test"
+        var message = MailMessage(id: 1, sender: "Zoe", senderEmail: "zoe@example.com", time: "Now", subject: "Plans", preview: "", body: "Body")
+        message.toRecipients = [
+            MailAddress(name: "Me", email: "ME@example.test"),
+            MailAddress(name: "Bob", email: "bob@example.com"),
+            MailAddress(name: "Zoe again", email: "Zoe@example.com")
+        ]
+        message.ccRecipients = [
+            MailAddress(name: "Other", email: "other@example.test"),
+            MailAddress(name: "Cara", email: "cara@example.com"),
+            MailAddress(name: "Bob", email: "BOB@example.com")
+        ]
+        store.messages = [message]
+        store.selectedMessageID = 1
+
+        store.beginReplyAll()
+
+        XCTAssertEqual(store.composeTitle, "Reply All")
+        XCTAssertEqual(store.composeTo, "zoe@example.com, bob@example.com")
+        XCTAssertEqual(store.composeCc, "cara@example.com")
+        XCTAssertTrue(store.composeShowsCcBcc)
+        XCTAssertEqual(store.composeSubject, "Re: Plans")
+        XCTAssertTrue(store.composeBcc.isEmpty)
+    }
+
+    @MainActor
+    func testReplyAllToOwnMessageFallsBackToSender() throws {
+        let suiteName = "HackMailTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = MailStore(defaults: defaults)
+        store.accounts = [MailAccount(email: "me@example.test")]
+        store.selectedAccount = "me@example.test"
+        var message = MailMessage(id: 1, sender: "Me", senderEmail: "me@example.test", time: "Now", subject: "Re: Note", preview: "", body: "Body")
+        message.toRecipients = [MailAddress(name: "Me", email: "me@example.test")]
+        store.messages = [message]
+        store.selectedMessageID = 1
+
+        store.beginReplyAll()
+
+        XCTAssertEqual(store.composeTo, "me@example.test")
+        XCTAssertTrue(store.composeCc.isEmpty)
+        XCTAssertEqual(store.composeSubject, "Re: Note")
+    }
 }

@@ -480,6 +480,8 @@ private struct MailToolbar: View {
                 Rectangle().fill(Paper.border).frame(width: 1, height: 18).padding(.horizontal, 5)
                 toolbarButton("arrowshape.turn.up.left", help: "Reply") { store.beginReply() }
                     .disabled(store.selectedMessage == nil || store.selectedMessage?.senderEmail.isEmpty != false || store.selectedMessage?.bodyIsLoading == true || store.syncingAccount != nil || store.isSendingMessage || store.isPreparingCompose)
+                toolbarButton("arrowshape.turn.up.left.2", help: "Reply All") { store.beginReplyAll() }
+                    .disabled(store.selectedMessage == nil || store.selectedMessage?.senderEmail.isEmpty != false || store.selectedMessage?.bodyIsLoading == true || store.syncingAccount != nil || store.isSendingMessage || store.isPreparingCompose)
                 toolbarButton("arrowshape.turn.up.right", help: "Forward") { store.beginForward() }
                     .disabled(store.selectedMessage == nil || store.selectedMessage?.bodyIsLoading == true || store.syncingAccount != nil || store.isSendingMessage || store.isPreparingCompose)
                 toolbarButton("printer", help: "Print Message") { store.printSelectedMessage() }
@@ -1001,7 +1003,7 @@ private struct ComposeView: View {
             if let quotedMessage = store.quotedMessage {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text(store.composeTitle == "Reply" ? "Original message" : "Forwarded message")
+                        Text(store.composeTitle == "Forward" ? "Forwarded message" : "Original message")
                             .font(.system(size: 12, weight: .semibold))
                         Spacer()
                         Text("\(quotedMessage.sender) · \(quotedMessage.time)")

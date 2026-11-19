@@ -1274,20 +1274,54 @@ enum IMAPServerResponseParser {
         let nsValue = value as NSString
         let matches = regex.matches(in: value, range: NSRange(location: 0, length: nsValue.length))
         guard !matches.isEmpty else { return value }
-        var output = value
-        for match in matches.reversed() {
+
+        // RFC 2047 section 6.2: whitespace between adjacent encoded words is ignored, and a character may
+        // be split across adjacent words of the same charset, so decode each run of words together.
+        var output = ""
+        var runCharset: String?
+        var runBytes = Data()
+        var runFallback = ""
+        func flushRun() {
+            guard let charset = runCharset else { return }
+            let encoding = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
+                CFStringConvertIANACharSetNameToEncoding(charset as CFString)
+            ))
+            output += String(data: runBytes, encoding: encoding) ?? runFallback
+            runCharset = nil
+            runBytes = Data()
+            runFallback = ""
+        }
+
+        var previousEnd = 0
+        for match in matches {
+            let gap = nsValue.substring(with: NSRange(location: previousEnd, length: match.range.location - previousEnd))
+            previousEnd = NSMaxRange(match.range)
             let charset = nsValue.substring(with: match.range(at: 1))
             let transferEncoding = nsValue.substring(with: match.range(at: 2)).lowercased()
             let payload = nsValue.substring(with: match.range(at: 3))
             let bytes = transferEncoding == "b"
                 ? Data(base64Encoded: payload)
                 : decodeQuotedPrintable(payload.replacingOccurrences(of: "_", with: " "))
-            let charsetEncoding = CFStringConvertEncodingToNSStringEncoding(
-                CFStringConvertIANACharSetNameToEncoding(charset as CFString)
-            )
-            let decoded = bytes.flatMap { String(data: $0, encoding: String.Encoding(rawValue: charsetEncoding)) } ?? payload
-            if let range = Range(match.range, in: output) { output.replaceSubrange(range, with: decoded) }
+
+            // Check scalars, not Characters: a folded header's CRLF is a single Character.
+            let gapIsOnlyWhitespace = gap.unicodeScalars.allSatisfy { $0 == " " || $0 == "\t" || $0 == "\r" || $0 == "\n" }
+            if let bytes, let current = runCharset, current.caseInsensitiveCompare(charset) == .orderedSame, gapIsOnlyWhitespace {
+                runBytes.append(bytes)
+                runFallback += payload
+                continue
+            }
+            flushRun()
+            output += gap
+            if let bytes {
+                runCharset = charset
+                runBytes = bytes
+                runFallback = payload
+            } else {
+                output += payload
+            }
         }
+        flushRun()
+        output += nsValue.substring(from: previousEnd)
         return output
     }
 

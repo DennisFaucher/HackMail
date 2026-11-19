@@ -60,7 +60,7 @@ fetches a bounded HTML MIME body part when available, falling back to plain text
 * Recipient autocomplete can search a user-selected macOS Contacts list after explicit Contacts permission; contact details are held in memory for the active compose session and are not saved by HackMail.
 * Network operations time out (20 s to connect, 30 s without data) and server responses are size-capped, so a stalled or oversized response ends the request with an error instead of hanging.
 * Email HTML is parsed and sanitized into a safe subset (no scripts, forms, embedded objects, unsafe links, or remote loads unless you opt in). Messages over 8 MiB, or HTML that cannot be parsed, display as plain text. The parser repairs malformed markup, so a few messages may lay out slightly differently than in other clients.
-* There is no Reply All, and recipient addresses must have ASCII domains. Only one message can be printed at a time.
+* Reply All adds the other To and Cc recipients (never your own accounts) but uses the From address, not a separate Reply-To header. Recipient addresses must have ASCII domains. Only one message can be printed at a time.
 * Automated tests cover SMTP formatting and attachments, IMAP command quoting, and the HTML sanitizer; real-server and cross-client behavior should be verified with your own accounts before relying on it.
 
 * LanguageTool spell/grammar checks are optional and off by default. When enabled, checks run against
