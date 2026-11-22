@@ -168,12 +168,8 @@ enum SMTPMessageBuilder {
     }
 
     private static func base64Lines(_ data: Data) -> String {
-        let encoded = data.base64EncodedString()
-        return stride(from: 0, to: encoded.count, by: 76).map { offset in
-            let start = encoded.index(encoded.startIndex, offsetBy: offset)
-            let end = encoded.index(start, offsetBy: min(76, encoded.distance(from: start, to: encoded.endIndex)))
-            return String(encoded[start..<end])
-        }.joined(separator: "\r\n")
+        // Linear-time wrapping; String index offsetting per line was O(n^2) for large attachments.
+        data.base64EncodedString(options: [.lineLength76Characters, .endLineWithCarriageReturn, .endLineWithLineFeed])
     }
 
     private static func rfc2231(_ value: String) -> String {
