@@ -309,6 +309,28 @@ struct GmailIMAPClient {
     }
 }
 
+/// Prepares a user-typed Gmail search for `X-GM-RAW`. The gmail.com search box accepts a space after an
+/// operator's colon (`to: tim subject: blade`), but IMAP expects the compact form (`to:tim subject:blade`).
+enum GmailSearchQuery {
+    private static let operators = [
+        "from", "to", "cc", "bcc", "subject", "label", "in", "is", "has", "filename", "before", "after",
+        "older", "newer", "older_than", "newer_than", "larger", "smaller", "size", "category", "deliveredto",
+        "list", "rfc822msgid", "id"
+    ].joined(separator: "|")
+
+    // An operator, its colon, then spaces before a value. The lookahead leaves `to: subject:x` alone, where
+    // the next word is another operator and the first has no value.
+    private static let spacedOperator = try! NSRegularExpression(
+        pattern: "(?<![\\w])(-?(?:\(operators)):)[ \\t]+(?=\\S)(?!(?:\(operators)):)",
+        options: [.caseInsensitive]
+    )
+
+    static func normalized(_ query: String) -> String {
+        let range = NSRange(query.startIndex..., in: query)
+        return spacedOperator.stringByReplacingMatches(in: query, range: range, withTemplate: "$1")
+    }
+}
+
 enum IMAPCommandText {
     /// Wraps `value` in an IMAP quoted string. Rejects CR, LF, NUL and other control characters, which
     /// would otherwise end the command early and let a value inject its own IMAP commands.
@@ -585,7 +607,7 @@ private actor IMAPSession {
         // Allow a generous silent period; the user can still cancel from the UI.
         receiveTimeout = Self.searchReceiveTimeout
         defer { receiveTimeout = Self.defaultReceiveTimeout }
-        let response = try await command("UID SEARCH X-GM-RAW \(try quote(query))")
+        let response = try await command("UID SEARCH X-GM-RAW \(try quote(GmailSearchQuery.normalized(query)))")
         return IMAPServerResponseParser.parseSearchUIDs(response.lines).sorted(by: >)
     }
 
