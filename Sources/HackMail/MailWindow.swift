@@ -741,6 +741,8 @@ private struct MessageReader: View {
                             .padding(.top, 4)
                             .accessibilityLabel("Email message content")
                             .id("\(message.id)-\(message.allowsRemoteImages)")
+                    } else if message.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !message.bodyIsLoading {
+                        Text("(No message text)").font(.system(size: 13)).italic().foregroundStyle(.secondary)
                     } else {
                         Text(PlainTextLinkFormatter.format(message.body)).font(.custom(Paper.mailFont, size: 15)).lineSpacing(7).textSelection(.enabled)
                     }

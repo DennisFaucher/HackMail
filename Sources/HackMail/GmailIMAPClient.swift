@@ -1,9 +1,10 @@
 import Foundation
 import CoreFoundation
 import Network
+import os
 
 struct GmailIMAPClient {
-    static let maximumAttachmentDownloadBytes = 25 * 1024 * 1024
+    static let maximumAttachmentDownloadBytes = 50 * 1024 * 1024
 
     func fetchMailbox(
         email: String,
@@ -234,9 +235,10 @@ struct GmailIMAPClient {
         password: String,
         shouldLogout: Bool = true,
         progress: (@Sendable (MailboxLoadProgress) -> Void)? = nil,
+        purpose: String = #function,
         operation: @Sendable (IMAPSession) async throws -> T
     ) async throws -> T {
-        let session = IMAPSession()
+        let session = IMAPSession(purpose: purpose)
         await session.setProgress(progress)
         return try await withTaskCancellationHandler {
             do {
@@ -353,7 +355,7 @@ private enum IMAPError: LocalizedError {
         case .authentication: "Gmail rejected the app password. Check the address and app password in Account Settings."
         case .noInbox: "Gmail did not return an Inbox mailbox."
         case .invalidSearchQuery: "Enter a Gmail search query without line breaks or control characters."
-        case .attachmentTooLarge: "This attachment exceeds HackMail's 25 MiB download limit."
+        case .attachmentTooLarge: "This attachment exceeds HackMail's 50 MiB download limit (measured as encoded in the email, about 37% larger than the file)."
         case .timeout: "Gmail did not respond in time. Check your connection and try again."
         case .invalidCommandText: "A value contained line breaks or control characters and was not sent to Gmail."
         case .responseTooLarge: "Gmail sent a response larger than HackMail accepts, so the request was stopped."
@@ -384,9 +386,31 @@ private actor IMAPSession {
     private static let defaultReceiveTimeout: Duration = .seconds(30)
     private static let searchReceiveTimeout: Duration = .seconds(180)
     private static let maximumLineBytes = 2 * 1024 * 1024
-    private static let maximumLiteralBytes = 32 * 1024 * 1024
+    private static let maximumLiteralBytes = 56 * 1024 * 1024
     private static let maximumResponseBytes = 64 * 1024 * 1024
 
+    private static let log = Logger(subsystem: "HackMail", category: "IMAPTiming")
+    /// Process-wide session numbering and live-session count, used only to label timing logs.
+    private static let counters = OSAllocatedUnfairLock(initialState: (nextID: 1, active: 0))
+    private let sessionID: Int
+    private let purpose: String
+    private var isCounted = false
+    private var sessionStart = ContinuousClock.now
+
+    init(purpose: String) {
+        self.sessionID = Self.counters.withLock { state in
+            defer { state.nextID += 1 }
+            return state.nextID
+        }
+        // Function name only, e.g. "fetchMailbox(email:...)" -> "fetchMailbox"; never arguments.
+        self.purpose = String(purpose.prefix { $0 != "(" })
+    }
+
+    /// "s7 fetchMailbox active=3": which session, which operation, how many sessions are open now.
+    private var logTag: String {
+        let active = Self.counters.withLock { $0.active }
+        return "s\(sessionID) \(purpose) active=\(active)"
+    }
     private let queue = DispatchQueue(label: "HackMail.GmailIMAP")
     private var receiveTimeout: Duration = IMAPSession.defaultReceiveTimeout
     private var progress: (@Sendable (MailboxLoadProgress) -> Void)?
@@ -406,6 +430,12 @@ private actor IMAPSession {
     }
 
     func open(email: String, password: String) async throws {
+        if !isCounted {
+            isCounted = true
+            Self.counters.withLock { $0.active += 1 }
+        }
+        sessionStart = ContinuousClock.now
+        Self.log.info("[\(self.logTag, privacy: .public)] session start")
         report(.connecting)
         let endpoint = NWEndpoint.Host("imap.gmail.com")
         guard let port = NWEndpoint.Port(rawValue: 993) else {
@@ -413,6 +443,7 @@ private actor IMAPSession {
         }
         let connection = NWConnection(host: endpoint, port: port, using: .tls)
         self.connection = connection
+        let connectStart = ContinuousClock.now
         let deadline = ConnectionDeadline(after: Self.connectTimeout, connection: connection)
         do {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
@@ -437,6 +468,7 @@ private actor IMAPSession {
             throw deadline.finish() ? IMAPError.timeout : error
         }
         deadline.finish()
+        Self.log.info("[\(self.logTag, privacy: .public)] connect+TLS \(Self.seconds(ContinuousClock.now - connectStart), privacy: .public)s")
 
         let greeting = try await readLine()
         guard greeting.uppercased().contains("* OK") else {
@@ -470,8 +502,11 @@ private actor IMAPSession {
         report(.fetchingHeaders)
         let first = max(1, total - max(1, limit) + 1)
         let response = try await command("FETCH \(first):\(total) (UID FLAGS INTERNALDATE ENVELOPE BODYSTRUCTURE)")
-        return response.lines.compactMap { IMAPServerResponseParser.parseMessage($0, mailboxPath: path) }
+        let parseStart = ContinuousClock.now
+        let parsed = response.lines.compactMap { IMAPServerResponseParser.parseMessage($0, mailboxPath: path) }
             .sorted { $0.id > $1.id }
+        Self.log.info("[\(self.logTag, privacy: .public)] parse headers: \(parsed.count, privacy: .public) messages in \(Self.seconds(ContinuousClock.now - parseStart), privacy: .public)s")
+        return parsed
     }
 
     func searchUIDs(after lastUID: Int?) async throws -> [Int] {
@@ -601,11 +636,15 @@ private actor IMAPSession {
         // Regular attachment bytes are fetched only after an explicit user save action.
         report(.bodyReadingStructure)
         let structureResponse = try await command("UID FETCH \(uid) (BODYSTRUCTURE)")
-        guard let structure = Self.parseBodyStructure(structureResponse.lines),
-              let bodyPart = Self.preferredTextPart(in: structure, preferHTML: preferHTML) else {
-            throw IMAPError.protocolError("This message has no supported plain-text or HTML body part.")
+        guard let structure = Self.parseBodyStructure(structureResponse.lines) else {
+            throw IMAPError.protocolError("Gmail returned no message structure.")
         }
         let attachments = IMAPAttachmentParser.parse(structureResponse.lines)
+        guard let bodyPart = Self.preferredTextPart(in: structure, preferHTML: preferHTML) else {
+            // A message with no text part (for example only an attachment, sent with a blank body) is
+            // valid: show it with an empty body and still list its attachments.
+            return FetchedMessageBody(content: "", isHTML: false, isPartial: false, attachments: attachments)
+        }
         let section = bodyPart.section.isEmpty ? "TEXT" : bodyPart.section
         let bodySection = full ? "BODY.PEEK[\(section)]" : "BODY.PEEK[\(section)]<0.65536>"
         report(.bodyFetching)
@@ -614,7 +653,11 @@ private actor IMAPSession {
             guard case .literal(let data) = segment else { return nil }
             return data
         }).first else {
-            throw IMAPError.protocolError("Gmail returned no message body.")
+            // An empty text part can come back as "" or NIL instead of a zero-length literal.
+            guard response.lines.contains(where: { $0.uppercased().contains("BODY[") }) else {
+                throw IMAPError.protocolError("Gmail returned no message body.")
+            }
+            return FetchedMessageBody(content: "", isHTML: bodyPart.isHTML, isPartial: false, attachments: attachments)
         }
         let fetchedBody = Self.decodeBody(
             literal,
@@ -797,6 +840,11 @@ private actor IMAPSession {
     }
 
     func close() {
+        if isCounted {
+            Self.log.info("[\(self.logTag, privacy: .public)] session end, lifetime \(Self.seconds(ContinuousClock.now - self.sessionStart), privacy: .public)s")
+            isCounted = false
+            Self.counters.withLock { $0.active -= 1 }
+        }
         connection?.cancel()
         connection = nil
         buffered.removeAll(keepingCapacity: false)
@@ -805,12 +853,16 @@ private actor IMAPSession {
     private func command(_ command: String) async throws -> Response {
         let tag = String(format: "A%04d", nextTag)
         nextTag += 1
+        let verb = Self.logVerb(command)
+        let started = ContinuousClock.now
+        var firstLineAt: ContinuousClock.Instant?
         try await send("\(tag) \(command)\r\n")
 
         var segments: [Segment] = []
         var responseBytes = 0
         while true {
             let line = try await readLineData()
+            if firstLineAt == nil { firstLineAt = ContinuousClock.now }
             segments.append(.line(line))
             responseBytes += line.count
             let text = String(decoding: line, as: UTF8.self)
@@ -827,9 +879,24 @@ private actor IMAPSession {
                 if status.hasPrefix("NO") || status.hasPrefix("BAD") {
                     throw IMAPError.protocolError(text.trimmingCharacters(in: .whitespacesAndNewlines))
                 }
+                let done = ContinuousClock.now
+                Self.log.info("[\(self.logTag, privacy: .public)] \(verb, privacy: .public): first byte \(Self.seconds(firstLineAt.map { $0 - started } ?? .zero), privacy: .public)s, total \(Self.seconds(done - started), privacy: .public)s, \(responseBytes, privacy: .public) bytes")
                 return Response(segments: segments)
             }
         }
+    }
+
+    /// Command name only (never arguments, which can hold credentials, folder names, or search text).
+    private static func logVerb(_ command: String) -> String {
+        let words = command.split(separator: " ", maxSplits: 2).map { $0.uppercased() }
+        guard let first = words.first else { return "?" }
+        if first == "UID", words.count > 1 { return "UID \(words[1])" }
+        return first
+    }
+
+    private static func seconds(_ duration: Duration) -> String {
+        let parts = duration.components
+        return String(format: "%.2f", Double(parts.seconds) + Double(parts.attoseconds) / 1e18)
     }
 
     private func send(_ string: String) async throws {
