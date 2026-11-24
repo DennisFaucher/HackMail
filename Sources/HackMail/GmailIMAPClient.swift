@@ -157,6 +157,53 @@ struct GmailIMAPClient {
         }
     }
 
+    /// Fetches a message's attachments in one session so they can be attached to a forward. Called only from
+    /// an explicit Forward. Attachments that exceed the per-attachment limit, or that would push the total
+    /// past `remainingBytes`, are skipped (by name) instead of failing the whole forward.
+    func fetchAttachmentsForForward(
+        uid: Int,
+        mailboxPath: String,
+        attachments: [MailAttachmentInfo],
+        remainingBytes: Int,
+        email: String,
+        password: String,
+        progress: (@Sendable (String) -> Void)? = nil
+    ) async throws -> ForwardedAttachments {
+        guard !attachments.isEmpty else { return ForwardedAttachments(attachments: [], skipped: []) }
+        return try await withSession(email: email, password: password) { session in
+            try await session.selectMailbox(path: mailboxPath)
+            var remaining = remainingBytes
+            var fetched: [MailAttachment] = []
+            var skipped: [String] = []
+            for (index, info) in attachments.enumerated() {
+                try Task.checkCancellation()
+                // Base64 inflates by ~4/3, so the decoded size is about 3/4 of the encoded size.
+                guard info.encodedSize <= Self.maximumAttachmentDownloadBytes, info.encodedSize / 4 * 3 <= remaining else {
+                    skipped.append(info.fileName)
+                    continue
+                }
+                progress?("Fetching attachment \(index + 1) of \(attachments.count)…")
+                do {
+                    let data = try await session.fetchAttachment(
+                        uid: uid,
+                        section: info.section,
+                        transferEncoding: info.transferEncoding,
+                        maximumBytes: min(remaining, Self.maximumAttachmentDownloadBytes)
+                    )
+                    remaining -= data.count
+                    fetched.append(MailAttachment(
+                        fileName: info.fileName,
+                        mimeType: info.mimeType.isEmpty ? "application/octet-stream" : info.mimeType,
+                        data: data
+                    ))
+                } catch IMAPError.attachmentTooLarge {
+                    skipped.append(info.fileName)
+                }
+            }
+            return ForwardedAttachments(attachments: fetched, skipped: skipped)
+        }
+    }
+
     func archive(uid: Int, mailboxPath: String, email: String, password: String, label: String = "Archiving the message…", progress: (@Sendable (MailboxLoadProgress) -> Void)? = nil) async throws {
         try await archive(uids: [uid], mailboxPath: mailboxPath, email: email, password: password, label: label, progress: progress)
     }
@@ -328,6 +375,11 @@ struct InboxMonitorState: Sendable {
     let messageCount: Int
     let unreadCount: Int
     let latestUID: Int?
+}
+
+struct ForwardedAttachments: Sendable {
+    let attachments: [MailAttachment]
+    let skipped: [String]
 }
 
 struct FetchedMessageBody: Sendable {

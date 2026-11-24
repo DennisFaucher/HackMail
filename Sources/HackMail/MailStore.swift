@@ -280,7 +280,7 @@ final class MailStore: ObservableObject {
         composeAttachments = []
         quotedMessage = nil
         quotedPlainText = ""
-        startPreparingQuote(for: message)
+        startPreparingQuote(for: message, includeAttachments: true)
     }
 
     func sendComposedMessage() async throws {
@@ -386,7 +386,7 @@ final class MailStore: ObservableObject {
         isComposing = false
     }
 
-    private func startPreparingQuote(for message: MailMessage) {
+    private func startPreparingQuote(for message: MailMessage, includeAttachments: Bool = false) {
         let preparationID = UUID()
         composePreparationID = preparationID
         composeBody = NSAttributedString(string: "")
@@ -397,12 +397,13 @@ final class MailStore: ObservableObject {
         composePreparationError = nil
         composePreparationMessage = "Preparing original message…"
         let accountEmail = selectedAccount
-        Task { await prepareQuote(for: message, accountEmail: accountEmail, preparationID: preparationID) }
+        Task { await prepareQuote(for: message, accountEmail: accountEmail, preparationID: preparationID, includeAttachments: includeAttachments) }
     }
 
-    private func prepareQuote(for message: MailMessage, accountEmail: String?, preparationID: UUID) async {
+    private func prepareQuote(for message: MailMessage, accountEmail: String?, preparationID: UUID, includeAttachments: Bool) async {
         var originalBody = message.body
         var isHTML = message.bodyIsHTML
+        var sourceAttachments = message.attachments
         if message.isRemote && (message.bodyIsPartial || originalBody.isEmpty || message.bodyIsHTML) {
             guard let account = accounts.first(where: { $0.email == accountEmail }),
                   let password = try? KeychainStore.loadPassword(for: account.email) else {
@@ -424,6 +425,7 @@ final class MailStore: ObservableObject {
                 guard composePreparationID == preparationID else { return }
                 originalBody = body.content
                 isHTML = body.isHTML
+                if !body.attachments.isEmpty { sourceAttachments = body.attachments }
                 if selectedAccount == account.email, selectedMailboxPath == message.mailboxPath {
                     messages = messages.map { item in
                         guard item.id == message.id else { return item }
@@ -454,10 +456,52 @@ final class MailStore: ObservableObject {
             isHTML ? HTMLTextExtractor.extract(originalBody) : HTMLTextExtractor.limitPlainText(originalBody)
         }.value
         guard composePreparationID == preparationID else { return }
+
+        // Forward is the explicit user action that authorizes fetching the original attachments. They land in
+        // the draft's attachment list, where each can be removed before sending.
+        var attachmentNotice: String?
+        if includeAttachments, message.isRemote, !sourceAttachments.isEmpty {
+            if let account = accounts.first(where: { $0.email == accountEmail }),
+               let password = try? KeychainStore.loadPassword(for: account.email) {
+                syncingAccount = account.email
+                composePreparationMessage = "Fetching attachment 1 of \(sourceAttachments.count)…"
+                do {
+                    let forwarded = try await GmailIMAPClient().fetchAttachmentsForForward(
+                        uid: message.id,
+                        mailboxPath: message.mailboxPath,
+                        attachments: sourceAttachments,
+                        remainingBytes: Self.maximumAttachmentBytes,
+                        email: account.email,
+                        password: password,
+                        progress: { [weak self] text in
+                            Task { @MainActor in
+                                guard let self, self.composePreparationID == preparationID else { return }
+                                self.composePreparationMessage = text
+                            }
+                        }
+                    )
+                    syncingAccount = nil
+                    guard composePreparationID == preparationID else { return }
+                    composeAttachments = forwarded.attachments
+                    if !forwarded.skipped.isEmpty {
+                        let limit = ByteCountFormatter.string(fromByteCount: Int64(Self.maximumAttachmentBytes), countStyle: .file)
+                        attachmentNotice = "Not attached (over the \(limit) total limit): \(forwarded.skipped.joined(separator: ", "))."
+                    }
+                } catch {
+                    syncingAccount = nil
+                    guard composePreparationID == preparationID else { return }
+                    attachmentNotice = "Could not fetch the original attachments: \(error.localizedDescription)"
+                }
+            } else {
+                attachmentNotice = "Could not fetch the original attachments. Check the Gmail account password."
+            }
+        }
+
         let signature = accounts.first(where: { $0.email == accountEmail })?.signature ?? ""
         composeBody = MailSignatureFormatter.draftBody(for: signature)
         quotedPlainText = result.text
         composeBodyWasTruncated = result.wasTruncated
+        composePreparationError = attachmentNotice
         composePreparationMessage = ""
         isPreparingCompose = false
     }
